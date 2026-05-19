@@ -519,6 +519,13 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         Err(e) => eprintln!("  GIF failed: {}", e),
     }
 
+    // Record demo GIF: diff review flow
+    println!("\n--- Demo GIF: diff_review ---");
+    match record_diff_review_demo(app_state.clone(), &mut cx) {
+        Ok(path) => println!("  GIF saved to: {}", path.display()),
+        Err(e) => eprintln!("  GIF failed: {}", e),
+    }
+
     // Clean up the main workspace's worktree to stop background scanning tasks
     // This prevents "root path could not be canonicalized" errors when main() drops temp_dir
     workspace_window
@@ -858,6 +865,279 @@ cargo run
     std::fs::write(project_path.join("README.md"), readme).expect("Failed to write README.md");
 }
 
+
+/// Records a demo GIF of the diff review flow:
+/// editor open → overlay → type comment → submit → more comments → collapse.
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn record_diff_review_demo(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+) -> Result<std::path::PathBuf> {
+    use gpui::FrameRecorder;
+
+    let output_dir = std::path::Path::new("target/visual_tests");
+    std::fs::create_dir_all(output_dir)?;
+    let output_path = output_dir.join("diff_review_demo.gif");
+
+    // --- Setup: git repo with one committed file then local modifications ---
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path = temp_dir.keep();
+    let canonical_temp = temp_path.canonicalize()?;
+    let project_path = canonical_temp.join("project");
+    std::fs::create_dir_all(&project_path)?;
+
+    for (args, dir) in [
+        (vec!["init"], &project_path),
+        (vec!["config", "user.email", "test@test.com"], &project_path),
+        (vec!["config", "user.name", "Test User"], &project_path),
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(dir)
+            .output()?;
+    }
+
+    std::fs::write(project_path.join("thread-view.tsx"), "// Original content\n")?;
+    std::process::Command::new("git")
+        .args(["add", "thread-view.tsx"])
+        .current_dir(&project_path)
+        .output()?;
+    std::process::Command::new("git")
+        .args(["commit", "-m", "Initial commit"])
+        .current_dir(&project_path)
+        .output()?;
+
+    std::fs::write(
+        project_path.join("thread-view.tsx"),
+        "import { ScrollArea } from 'components';\nimport { ButtonAlt, Tooltip } from 'ui';\nimport { Message, FileEdit } from 'types';\nimport { AiPaneTabContext } from 'context';\n",
+    )?;
+
+    let bounds = Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: size(px(600.0), px(400.0)),
+    };
+
+    let project = cx.update(|cx| {
+        project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+
+    let add_worktree_task = project.update(cx, |project, cx| {
+        project.find_or_create_worktree(&project_path, true, cx)
+    });
+    cx.background_executor.allow_parking();
+    cx.foreground_executor.block_test(add_worktree_task).log_err();
+    cx.background_executor.forbid_parking();
+    cx.run_until_parked();
+
+    for _ in 0..5 {
+        cx.advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["diff-review".to_string()]);
+    });
+
+    let workspace_window: WindowHandle<Workspace> = cx
+        .update(|cx| {
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    cx.new(|cx| {
+                        Workspace::new(None, project.clone(), app_state.clone(), window, cx)
+                    })
+                },
+            )
+        })
+        .context("Failed to open diff review window")?;
+
+    cx.run_until_parked();
+
+    // Open the modified file
+    let open_file_task = workspace_window
+        .update(cx, |workspace, window, cx| {
+            let worktree = workspace.project().read(cx).worktrees(cx).next();
+            worktree.map(|wt| {
+                let worktree_id = wt.read(cx).id();
+                let rel_path: std::sync::Arc<util::rel_path::RelPath> =
+                    util::rel_path::rel_path("thread-view.tsx").into();
+                let project_path: project::ProjectPath = (worktree_id, rel_path).into();
+                workspace.open_path(project_path, None, true, window, cx)
+            })
+        })
+        .log_err()
+        .flatten();
+
+    if let Some(task) = open_file_task {
+        cx.background_executor.allow_parking();
+        cx.foreground_executor.block_test(task).log_err();
+        cx.background_executor.forbid_parking();
+    }
+
+    for _ in 0..5 {
+        cx.advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+
+    // --- GIF recording ---
+    let mut recorder = FrameRecorder::new(Duration::from_millis(600));
+    let window: gpui::AnyWindowHandle = workspace_window.into();
+
+    // Frame 1: editor with modified file (diff gutter visible)
+    recorder.push_frame_with_delay(cx.capture_screenshot(window)?, Duration::from_millis(800));
+
+    // Show diff review overlay on line 1
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            let editors: Vec<_> = workspace.items_of_type::<editor::Editor>(cx).collect();
+            if let Some(editor) = editors.into_iter().next() {
+                editor.update(cx, |editor, cx| {
+                    editor.show_diff_review_overlay(DisplayRow(1)..DisplayRow(1), window, cx);
+                });
+            }
+        })
+        .log_err();
+
+    for _ in 0..3 {
+        cx.advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+
+    // Frame 2: overlay open (empty prompt)
+    cx.record_frame(window, &mut recorder)?;
+
+    // Type a comment
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            let editors: Vec<_> = workspace.items_of_type::<editor::Editor>(cx).collect();
+            if let Some(editor) = editors.into_iter().next() {
+                editor.update(cx, |editor, cx| {
+                    if let Some(prompt_editor) = editor.diff_review_prompt_editor().cloned() {
+                        prompt_editor.update(cx, |pe, cx| {
+                            pe.insert("This change needs better error handling", window, cx);
+                        });
+                    }
+                });
+            }
+        })
+        .log_err();
+
+    for _ in 0..3 {
+        cx.advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+
+    // Frame 3: comment typed
+    cx.record_frame(window, &mut recorder)?;
+
+    // Submit first comment
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            let editors: Vec<_> = workspace.items_of_type::<editor::Editor>(cx).collect();
+            if let Some(editor) = editors.into_iter().next() {
+                editor.update(cx, |editor, cx| {
+                    editor.submit_diff_review_comment(window, cx);
+                });
+            }
+        })
+        .log_err();
+
+    for _ in 0..3 {
+        cx.advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+
+    // Frame 4: first comment submitted
+    cx.record_frame(window, &mut recorder)?;
+
+    // Add two more comments
+    workspace_window
+        .update(cx, |workspace, window, cx| {
+            let editors: Vec<_> = workspace.items_of_type::<editor::Editor>(cx).collect();
+            if let Some(editor) = editors.into_iter().next() {
+                editor.update(cx, |editor, cx| {
+                    if let Some(pe) = editor.diff_review_prompt_editor().cloned() {
+                        pe.update(cx, |pe, cx| {
+                            pe.insert("Second comment about imports", window, cx);
+                        });
+                    }
+                    editor.submit_diff_review_comment(window, cx);
+                    if let Some(pe) = editor.diff_review_prompt_editor().cloned() {
+                        pe.update(cx, |pe, cx| {
+                            pe.insert("Third comment about naming conventions", window, cx);
+                        });
+                    }
+                    editor.submit_diff_review_comment(window, cx);
+                });
+            }
+        })
+        .log_err();
+
+    for _ in 0..3 {
+        cx.advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+
+    // Frame 5: three comments expanded (hold)
+    recorder.push_frame_with_delay(cx.capture_screenshot(window)?, Duration::from_millis(1000));
+
+    // Collapse comments
+    workspace_window
+        .update(cx, |workspace, _window, cx| {
+            let editors: Vec<_> = workspace.items_of_type::<editor::Editor>(cx).collect();
+            if let Some(editor) = editors.into_iter().next() {
+                editor.update(cx, |editor, cx| {
+                    editor.set_diff_review_comments_expanded(false, cx);
+                });
+            }
+        })
+        .log_err();
+
+    for _ in 0..3 {
+        cx.advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+
+    // Frame 6: collapsed
+    cx.record_frame(window, &mut recorder)?;
+
+    recorder.export_gif(&output_path)?;
+
+    // Cleanup
+    workspace_window
+        .update(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            project.update(cx, |project, cx| {
+                let ids: Vec<_> = project.worktrees(cx).map(|wt| wt.read(cx).id()).collect();
+                for id in ids {
+                    project.remove_worktree(id, cx);
+                }
+            });
+        })
+        .log_err();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, _| window.remove_window()).log_err();
+    cx.run_until_parked();
+
+    Ok(output_path)
+}
 
 /// Records a demo GIF of the file picker: workspace → open picker → type → close.
 #[cfg(all(target_os = "macos", feature = "visual-tests"))]
