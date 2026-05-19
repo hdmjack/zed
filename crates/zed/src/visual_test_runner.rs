@@ -871,11 +871,11 @@ fn record_file_picker_demo(
     std::fs::create_dir_all(output_dir)?;
     let output_path = output_dir.join("file_picker_demo.gif");
 
-    let mut recorder = FrameRecorder::new(Duration::from_millis(600));
+    let mut recorder = FrameRecorder::new(Duration::from_millis(150));
     let window: gpui::AnyWindowHandle = workspace_window.into();
 
-    // Frame 1: workspace at rest
-    cx.record_frame(window, &mut recorder)?;
+    // Frame 1: workspace at rest — hold longer so viewer sees initial state
+    recorder.push_frame_with_delay(cx.capture_screenshot(window)?, Duration::from_millis(500));
 
     // Dispatch ToggleFileFinder through MultiWorkspace — workspace_actions are registered
     // on the div rendered by MultiWorkspace, so action dispatch reaches the handler.
@@ -888,10 +888,10 @@ fn record_file_picker_demo(
         cx.record_frame(window, &mut recorder)?;
     }
 
-    // Hold on the results for longer
+    // Hold on the final results so viewer can read them
     recorder.push_frame_with_delay(
         cx.capture_screenshot(window)?,
-        Duration::from_millis(1200),
+        Duration::from_millis(800),
     );
 
     // Close picker
