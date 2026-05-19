@@ -397,6 +397,11 @@ impl VisualTestAppContext {
         recorder: &mut crate::FrameRecorder,
     ) -> Result<()> {
         self.run_until_parked();
+        self.update_window(window, |_, window, _cx| {
+            window.refresh();
+        })
+        .ok();
+        self.run_until_parked();
         let image = self.capture_screenshot(window)?;
         recorder.push_frame(image);
         Ok(())

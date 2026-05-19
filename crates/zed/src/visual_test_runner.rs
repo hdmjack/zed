@@ -119,7 +119,7 @@ use {
         time::Duration,
     },
     util::ResultExt as _,
-    workspace::{AppState, MultiWorkspace, Workspace},
+    workspace::{AppState, MultiWorkspace, Workspace, ToggleFileFinder},
     zed_actions::OpenSettingsAt,
 };
 
@@ -166,10 +166,12 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
 
     // Add the test project as a worktree
     let add_worktree_task = workspace_window
-        .update(&mut cx, |workspace, _window, cx| {
-            let project = workspace.project().clone();
-            project.update(cx, |project, cx| {
-                project.find_or_create_worktree(&project_path, true, cx)
+        .update(&mut cx, |mw, _window, cx| {
+            mw.workspace().update(cx, |workspace, cx| {
+                let project = workspace.project().clone();
+                project.update(cx, |project, cx| {
+                    project.find_or_create_worktree(&project_path, true, cx)
+                })
             })
         })
         .context("Failed to start adding worktree")?;
@@ -187,8 +189,10 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
 
     // Create and add the project panel
     let (weak_workspace, async_window_cx) = workspace_window
-        .update(&mut cx, |workspace, window, cx| {
-            (workspace.weak_handle(), window.to_async(cx))
+        .update(&mut cx, |mw, window, cx| {
+            let weak_workspace = mw.workspace().read(cx).weak_handle();
+            let async_window_cx = window.to_async(cx);
+            (weak_workspace, async_window_cx)
         })
         .context("Failed to get workspace handle")?;
 
@@ -200,8 +204,10 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     cx.background_executor.forbid_parking();
 
     workspace_window
-        .update(&mut cx, |workspace, window, cx| {
-            workspace.add_panel(panel, window, cx);
+        .update(&mut cx, |mw, window, cx| {
+            mw.workspace().update(cx, |workspace, cx| {
+                workspace.add_panel(panel, window, cx);
+            });
         })
         .log_err();
 
@@ -209,8 +215,10 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
 
     // Open the project panel
     workspace_window
-        .update(&mut cx, |workspace, window, cx| {
-            workspace.open_panel::<ProjectPanel>(window, cx);
+        .update(&mut cx, |mw, window, cx| {
+            mw.workspace().update(cx, |workspace, cx| {
+                workspace.open_panel::<ProjectPanel>(window, cx);
+            });
         })
         .log_err();
 
@@ -218,17 +226,19 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
 
     // Open main.rs in the editor
     let open_file_task = workspace_window
-        .update(&mut cx, |workspace, window, cx| {
-            let worktree = workspace.project().read(cx).worktrees(cx).next();
-            if let Some(worktree) = worktree {
-                let worktree_id = worktree.read(cx).id();
-                let rel_path: std::sync::Arc<util::rel_path::RelPath> =
-                    util::rel_path::rel_path("src/main.rs").into();
-                let project_path: project::ProjectPath = (worktree_id, rel_path).into();
-                Some(workspace.open_path(project_path, None, true, window, cx))
-            } else {
-                None
-            }
+        .update(&mut cx, |mw, window, cx| {
+            mw.workspace().update(cx, |workspace, cx| {
+                let worktree = workspace.project().read(cx).worktrees(cx).next();
+                if let Some(worktree) = worktree {
+                    let worktree_id = worktree.read(cx).id();
+                    let rel_path: std::sync::Arc<util::rel_path::RelPath> =
+                        util::rel_path::rel_path("src/main.rs").into();
+                    let project_path: project::ProjectPath = (worktree_id, rel_path).into();
+                    Some(workspace.open_path(project_path, None, true, window, cx))
+                } else {
+                    None
+                }
+            })
         })
         .log_err()
         .flatten();
@@ -239,12 +249,14 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         cx.background_executor.forbid_parking();
         if let Ok(item) = block_result {
             workspace_window
-                .update(&mut cx, |workspace, window, cx| {
-                    let pane = workspace.active_pane().clone();
-                    pane.update(cx, |pane, cx| {
-                        if let Some(index) = pane.index_for_item(item.as_ref()) {
-                            pane.activate_item(index, true, true, window, cx);
-                        }
+                .update(&mut cx, |mw, window, cx| {
+                    mw.workspace().update(cx, |workspace, cx| {
+                        let pane = workspace.active_pane().clone();
+                        pane.update(cx, |pane, cx| {
+                            if let Some(index) = pane.index_for_item(item.as_ref()) {
+                                pane.activate_item(index, true, true, window, cx);
+                            }
+                        });
                     });
                 })
                 .log_err();
@@ -293,8 +305,10 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
 
     // Close project panel for this test
     workspace_window
-        .update(&mut cx, |workspace, window, cx| {
-            workspace.close_panel::<ProjectPanel>(window, cx);
+        .update(&mut cx, |mw, window, cx| {
+            mw.workspace().update(cx, |workspace, cx| {
+                workspace.close_panel::<ProjectPanel>(window, cx);
+            });
         })
         .log_err();
 
@@ -498,17 +512,26 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         }
     }
 
+    // Record demo GIF: file picker flow
+    println!("\n--- Demo GIF: file_picker ---");
+    match record_file_picker_demo(&mut cx, workspace_window) {
+        Ok(path) => println!("  GIF saved to: {}", path.display()),
+        Err(e) => eprintln!("  GIF failed: {}", e),
+    }
+
     // Clean up the main workspace's worktree to stop background scanning tasks
     // This prevents "root path could not be canonicalized" errors when main() drops temp_dir
     workspace_window
-        .update(&mut cx, |workspace, _window, cx| {
-            let project = workspace.project().clone();
-            project.update(cx, |project, cx| {
-                let worktree_ids: Vec<_> =
-                    project.worktrees(cx).map(|wt| wt.read(cx).id()).collect();
-                for id in worktree_ids {
-                    project.remove_worktree(id, cx);
-                }
+        .update(&mut cx, |mw, _window, cx| {
+            mw.workspace().update(cx, |workspace, cx| {
+                let project = workspace.project().clone();
+                project.update(cx, |project, cx| {
+                    let worktree_ids: Vec<_> =
+                        project.worktrees(cx).map(|wt| wt.read(cx).id()).collect();
+                    for id in worktree_ids {
+                        project.remove_worktree(id, cx);
+                    }
+                });
             });
         })
         .log_err();
@@ -835,6 +858,49 @@ cargo run
     std::fs::write(project_path.join("README.md"), readme).expect("Failed to write README.md");
 }
 
+
+/// Records a demo GIF of the file picker: workspace → open picker → type → close.
+#[cfg(all(target_os = "macos", feature = "visual-tests"))]
+fn record_file_picker_demo(
+    cx: &mut VisualTestAppContext,
+    workspace_window: WindowHandle<MultiWorkspace>,
+) -> Result<std::path::PathBuf> {
+    use gpui::FrameRecorder;
+
+    let output_dir = std::path::Path::new("target/visual_tests");
+    std::fs::create_dir_all(output_dir)?;
+    let output_path = output_dir.join("file_picker_demo.gif");
+
+    let mut recorder = FrameRecorder::new(Duration::from_millis(600));
+    let window: gpui::AnyWindowHandle = workspace_window.into();
+
+    // Frame 1: workspace at rest
+    cx.record_frame(window, &mut recorder)?;
+
+    // Dispatch ToggleFileFinder through MultiWorkspace — workspace_actions are registered
+    // on the div rendered by MultiWorkspace, so action dispatch reaches the handler.
+    cx.dispatch_action(window, ToggleFileFinder::default());
+    cx.record_frame(window, &mut recorder)?;
+
+    // Type "main" one character at a time, capturing each keystroke
+    for ch in "main".chars() {
+        cx.simulate_input(window, &ch.to_string());
+        cx.record_frame(window, &mut recorder)?;
+    }
+
+    // Hold on the results for longer
+    recorder.push_frame_with_delay(
+        cx.capture_screenshot(window)?,
+        Duration::from_millis(1200),
+    );
+
+    // Close picker
+    cx.simulate_keystrokes(window, "escape");
+    cx.record_frame(window, &mut recorder)?;
+
+    recorder.export_gif(&output_path)?;
+    Ok(output_path)
+}
 
 /// Runs visual tests for breakpoint hover states in the editor gutter.
 ///

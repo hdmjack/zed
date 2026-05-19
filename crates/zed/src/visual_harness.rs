@@ -2,7 +2,7 @@
 //!
 //! `setup_zed_for_visual_test` initialises all Zed subsystems inside a
 //! `VisualTestAppContext` and opens an off-screen workspace window.  Callers get
-//! back a `WindowHandle<Workspace>` they can drive with `dispatch_action`,
+//! back a `WindowHandle<MultiWorkspace>` they can drive with `dispatch_action`,
 //! `simulate_keystrokes`, `record_frame`, etc.
 
 use anyhow::{Context as _, Result};
@@ -10,16 +10,16 @@ use assets::Assets;
 use gpui::{App, AppContext as _, Bounds, VisualTestAppContext, WindowBounds, WindowHandle, WindowOptions, point, px, size};
 use settings::{NotifyWhenAgentWaiting, PlaySoundWhenAgentDone, Settings as _};
 use std::sync::Arc;
-use workspace::{AppState, Workspace};
+use workspace::{AppState, MultiWorkspace, Workspace};
 
 /// Initialises all Zed subsystems and opens an off-screen workspace window.
 ///
-/// The returned `WindowHandle<Workspace>` is positioned off-screen and invisible
+/// The returned `WindowHandle<MultiWorkspace>` is positioned off-screen and invisible
 /// to the user but fully rendered by the Metal compositor.  Use it with
 /// `cx.dispatch_action`, `cx.simulate_keystrokes`, and `cx.record_frame`.
 pub fn setup_zed_for_visual_test(
     cx: &mut VisualTestAppContext,
-) -> Result<(WindowHandle<Workspace>, Arc<AppState>)> {
+) -> Result<(WindowHandle<MultiWorkspace>, Arc<AppState>)> {
     // Load embedded fonts so UI renders with correct typefaces
     cx.update(|cx| {
         Assets.load_fonts(cx).unwrap();
@@ -61,6 +61,7 @@ pub fn setup_zed_for_visual_test(
             },
             wrap_div_with_search_actions: search::buffer_search::register_pane_search_actions,
         });
+        file_finder::init(cx);
         prompt_store::init(cx);
         let prompt_builder = prompt_store::PromptBuilder::load(app_state.fs.clone(), false, cx);
         language_model::init(cx);
@@ -119,7 +120,7 @@ pub fn setup_zed_for_visual_test(
         )
     });
 
-    let workspace_window: WindowHandle<Workspace> = cx
+    let workspace_window: WindowHandle<MultiWorkspace> = cx
         .update(|cx| {
             cx.open_window(
                 WindowOptions {
@@ -130,7 +131,10 @@ pub fn setup_zed_for_visual_test(
                 },
                 |window, cx| {
                     cx.new(|cx| {
-                        Workspace::new(None, project.clone(), app_state.clone(), window, cx)
+                        let workspace = cx.new(|cx| {
+                            Workspace::new(None, project.clone(), app_state.clone(), window, cx)
+                        });
+                        MultiWorkspace::new(workspace, window, cx)
                     })
                 },
             )
