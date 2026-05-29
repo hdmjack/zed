@@ -30,9 +30,13 @@
 //! Update baseline images (when UI intentionally changes):
 //!   UPDATE_BASELINE=1 cargo run -p zed --bin zed_visual_test_runner --features visual-tests
 //!
+//! Generate a demo GIF (for tests that use `VisualTestSession`):
+//!   RECORD_GIF=1 cargo run -p zed --bin zed_visual_test_runner --features visual-tests
+//!
 //! ## Environment Variables
 //!
-//!   UPDATE_BASELINE - Set to update baseline images instead of comparing
+//!   UPDATE_BASELINE        - Set to update baseline images instead of comparing
+//!   RECORD_GIF             - Set to record GIF output instead of comparing (requires VisualTestSession)
 //!   VISUAL_TEST_OUTPUT_DIR - Directory to save test output (default: target/visual_tests)
 
 // Stub main for non-macOS platforms
@@ -423,16 +427,27 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     }
 
     // Run Test 7: Diff Review Button visual tests
+    // Set RECORD_GIF=1 to produce target/visual_tests/diff_review_demo.gif instead of comparing.
     println!("\n--- Test 7: diff_review_button (3 variants) ---");
-    match run_diff_review_visual_tests(app_state.clone(), &mut cx, update_baseline) {
-        Ok(TestResult::Passed) => {
-            println!("✓ diff_review_button: PASSED");
-            passed += 1;
+    let mut diff_session = VisualTestSession::new(update_baseline);
+    match run_diff_review_visual_tests(app_state.clone(), &mut cx, &mut diff_session) {
+        Ok(()) if diff_session.is_gif_mode() => {
+            let gif_path = PathBuf::from("target/visual_tests").join("diff_review_demo.gif");
+            match diff_session.export_gif(&gif_path) {
+                Ok(()) => println!("  GIF saved to: {}", gif_path.display()),
+                Err(e) => eprintln!("  GIF failed: {}", e),
+            }
         }
-        Ok(TestResult::BaselineUpdated(_)) => {
-            println!("✓ diff_review_button: Baselines updated");
-            updated += 1;
-        }
+        Ok(()) => match diff_session.combined_result() {
+            TestResult::Passed => {
+                println!("✓ diff_review_button: PASSED");
+                passed += 1;
+            }
+            TestResult::BaselineUpdated(_) => {
+                println!("✓ diff_review_button: Baselines updated");
+                updated += 1;
+            }
+        },
         Err(e) => {
             eprintln!("✗ diff_review_button: FAILED - {}", e);
             failed += 1;
@@ -519,13 +534,6 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         Err(e) => eprintln!("  GIF failed: {}", e),
     }
 
-    // Record demo GIF: diff review flow
-    println!("\n--- Demo GIF: diff_review ---");
-    match record_diff_review_demo(app_state.clone(), &mut cx) {
-        Ok(path) => println!("  GIF saved to: {}", path.display()),
-        Err(e) => eprintln!("  GIF failed: {}", e),
-    }
-
     // Clean up the main workspace's worktree to stop background scanning tasks
     // This prevents "root path could not be canonicalized" errors when main() drops temp_dir
     workspace_window
@@ -581,6 +589,59 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
 enum TestResult {
     Passed,
     BaselineUpdated(PathBuf),
+}
+
+#[cfg(target_os = "macos")]
+struct VisualTestSession {
+    record_gif: bool,
+    update_baseline: bool,
+    recorder: gpui::FrameRecorder,
+    results: Vec<TestResult>,
+}
+
+#[cfg(target_os = "macos")]
+impl VisualTestSession {
+    /// Reads `RECORD_GIF` env var to pick mode; gif mode skips baseline comparison.
+    fn new(update_baseline: bool) -> Self {
+        Self {
+            record_gif: std::env::var("RECORD_GIF").is_ok(),
+            update_baseline,
+            recorder: gpui::FrameRecorder::new(Duration::from_millis(600)),
+            results: Vec::new(),
+        }
+    }
+
+    fn is_gif_mode(&self) -> bool {
+        self.record_gif
+    }
+
+    fn assert_snapshot(
+        &mut self,
+        test_name: &str,
+        window: gpui::AnyWindowHandle,
+        cx: &mut VisualTestAppContext,
+    ) -> Result<()> {
+        if self.record_gif {
+            cx.record_frame(window, &mut self.recorder)?;
+        } else {
+            let result = run_visual_test(test_name, window, cx, self.update_baseline)?;
+            self.results.push(result);
+        }
+        Ok(())
+    }
+
+    fn export_gif(&self, path: &Path) -> Result<()> {
+        self.recorder.export_gif(path)
+    }
+
+    fn combined_result(self) -> TestResult {
+        self.results
+            .into_iter()
+            .fold(TestResult::Passed, |acc, r| match r {
+                TestResult::Passed => acc,
+                TestResult::BaselineUpdated(p) => TestResult::BaselineUpdated(p),
+            })
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -863,280 +924,6 @@ cargo run
 ```
 "#;
     std::fs::write(project_path.join("README.md"), readme).expect("Failed to write README.md");
-}
-
-
-/// Records a demo GIF of the diff review flow:
-/// editor open → overlay → type comment → submit → more comments → collapse.
-#[cfg(all(target_os = "macos", feature = "visual-tests"))]
-fn record_diff_review_demo(
-    app_state: Arc<AppState>,
-    cx: &mut VisualTestAppContext,
-) -> Result<std::path::PathBuf> {
-    use gpui::FrameRecorder;
-
-    let output_dir = std::path::Path::new("target/visual_tests");
-    std::fs::create_dir_all(output_dir)?;
-    let output_path = output_dir.join("diff_review_demo.gif");
-
-    // --- Setup: git repo with one committed file then local modifications ---
-    let temp_dir = tempfile::tempdir()?;
-    let temp_path = temp_dir.keep();
-    let canonical_temp = temp_path.canonicalize()?;
-    let project_path = canonical_temp.join("project");
-    std::fs::create_dir_all(&project_path)?;
-
-    for (args, dir) in [
-        (vec!["init"], &project_path),
-        (vec!["config", "user.email", "test@test.com"], &project_path),
-        (vec!["config", "user.name", "Test User"], &project_path),
-    ] {
-        std::process::Command::new("git")
-            .args(&args)
-            .current_dir(dir)
-            .output()?;
-    }
-
-    std::fs::write(project_path.join("thread-view.tsx"), "// Original content\n")?;
-    std::process::Command::new("git")
-        .args(["add", "thread-view.tsx"])
-        .current_dir(&project_path)
-        .output()?;
-    std::process::Command::new("git")
-        .args(["commit", "-m", "Initial commit"])
-        .current_dir(&project_path)
-        .output()?;
-
-    std::fs::write(
-        project_path.join("thread-view.tsx"),
-        "import { ScrollArea } from 'components';\nimport { ButtonAlt, Tooltip } from 'ui';\nimport { Message, FileEdit } from 'types';\nimport { AiPaneTabContext } from 'context';\n",
-    )?;
-
-    let bounds = Bounds {
-        origin: point(px(0.0), px(0.0)),
-        size: size(px(600.0), px(400.0)),
-    };
-
-    let project = cx.update(|cx| {
-        project::Project::local(
-            app_state.client.clone(),
-            app_state.node_runtime.clone(),
-            app_state.user_store.clone(),
-            app_state.languages.clone(),
-            app_state.fs.clone(),
-            None,
-            project::LocalProjectFlags {
-                init_worktree_trust: false,
-                ..Default::default()
-            },
-            cx,
-        )
-    });
-
-    let add_worktree_task = project.update(cx, |project, cx| {
-        project.find_or_create_worktree(&project_path, true, cx)
-    });
-    cx.background_executor.allow_parking();
-    cx.foreground_executor.block_test(add_worktree_task).log_err();
-    cx.background_executor.forbid_parking();
-    cx.run_until_parked();
-
-    for _ in 0..5 {
-        cx.advance_clock(Duration::from_millis(100));
-        cx.run_until_parked();
-    }
-
-    cx.update(|cx| {
-        cx.update_flags(true, vec!["diff-review".to_string()]);
-    });
-
-    let workspace_window: WindowHandle<Workspace> = cx
-        .update(|cx| {
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    focus: false,
-                    show: false,
-                    ..Default::default()
-                },
-                |window, cx| {
-                    cx.new(|cx| {
-                        Workspace::new(None, project.clone(), app_state.clone(), window, cx)
-                    })
-                },
-            )
-        })
-        .context("Failed to open diff review window")?;
-
-    cx.run_until_parked();
-
-    // Open the modified file
-    let open_file_task = workspace_window
-        .update(cx, |workspace, window, cx| {
-            let worktree = workspace.project().read(cx).worktrees(cx).next();
-            worktree.map(|wt| {
-                let worktree_id = wt.read(cx).id();
-                let rel_path: std::sync::Arc<util::rel_path::RelPath> =
-                    util::rel_path::rel_path("thread-view.tsx").into();
-                let project_path: project::ProjectPath = (worktree_id, rel_path).into();
-                workspace.open_path(project_path, None, true, window, cx)
-            })
-        })
-        .log_err()
-        .flatten();
-
-    if let Some(task) = open_file_task {
-        cx.background_executor.allow_parking();
-        cx.foreground_executor.block_test(task).log_err();
-        cx.background_executor.forbid_parking();
-    }
-
-    for _ in 0..5 {
-        cx.advance_clock(Duration::from_millis(100));
-        cx.run_until_parked();
-    }
-
-    // --- GIF recording ---
-    let mut recorder = FrameRecorder::new(Duration::from_millis(600));
-    let window: gpui::AnyWindowHandle = workspace_window.into();
-
-    // Frame 1: editor with modified file (diff gutter visible)
-    recorder.push_frame_with_delay(cx.capture_screenshot(window)?, Duration::from_millis(800));
-
-    // Show diff review overlay on line 1
-    workspace_window
-        .update(cx, |workspace, window, cx| {
-            let editors: Vec<_> = workspace.items_of_type::<editor::Editor>(cx).collect();
-            if let Some(editor) = editors.into_iter().next() {
-                editor.update(cx, |editor, cx| {
-                    editor.show_diff_review_overlay(DisplayRow(1)..DisplayRow(1), window, cx);
-                });
-            }
-        })
-        .log_err();
-
-    for _ in 0..3 {
-        cx.advance_clock(Duration::from_millis(100));
-        cx.run_until_parked();
-    }
-
-    // Frame 2: overlay open (empty prompt)
-    cx.record_frame(window, &mut recorder)?;
-
-    // Type a comment
-    workspace_window
-        .update(cx, |workspace, window, cx| {
-            let editors: Vec<_> = workspace.items_of_type::<editor::Editor>(cx).collect();
-            if let Some(editor) = editors.into_iter().next() {
-                editor.update(cx, |editor, cx| {
-                    if let Some(prompt_editor) = editor.diff_review_prompt_editor().cloned() {
-                        prompt_editor.update(cx, |pe, cx| {
-                            pe.insert("This change needs better error handling", window, cx);
-                        });
-                    }
-                });
-            }
-        })
-        .log_err();
-
-    for _ in 0..3 {
-        cx.advance_clock(Duration::from_millis(100));
-        cx.run_until_parked();
-    }
-
-    // Frame 3: comment typed
-    cx.record_frame(window, &mut recorder)?;
-
-    // Submit first comment
-    workspace_window
-        .update(cx, |workspace, window, cx| {
-            let editors: Vec<_> = workspace.items_of_type::<editor::Editor>(cx).collect();
-            if let Some(editor) = editors.into_iter().next() {
-                editor.update(cx, |editor, cx| {
-                    editor.submit_diff_review_comment(window, cx);
-                });
-            }
-        })
-        .log_err();
-
-    for _ in 0..3 {
-        cx.advance_clock(Duration::from_millis(100));
-        cx.run_until_parked();
-    }
-
-    // Frame 4: first comment submitted
-    cx.record_frame(window, &mut recorder)?;
-
-    // Add two more comments
-    workspace_window
-        .update(cx, |workspace, window, cx| {
-            let editors: Vec<_> = workspace.items_of_type::<editor::Editor>(cx).collect();
-            if let Some(editor) = editors.into_iter().next() {
-                editor.update(cx, |editor, cx| {
-                    if let Some(pe) = editor.diff_review_prompt_editor().cloned() {
-                        pe.update(cx, |pe, cx| {
-                            pe.insert("Second comment about imports", window, cx);
-                        });
-                    }
-                    editor.submit_diff_review_comment(window, cx);
-                    if let Some(pe) = editor.diff_review_prompt_editor().cloned() {
-                        pe.update(cx, |pe, cx| {
-                            pe.insert("Third comment about naming conventions", window, cx);
-                        });
-                    }
-                    editor.submit_diff_review_comment(window, cx);
-                });
-            }
-        })
-        .log_err();
-
-    for _ in 0..3 {
-        cx.advance_clock(Duration::from_millis(100));
-        cx.run_until_parked();
-    }
-
-    // Frame 5: three comments expanded (hold)
-    recorder.push_frame_with_delay(cx.capture_screenshot(window)?, Duration::from_millis(1000));
-
-    // Collapse comments
-    workspace_window
-        .update(cx, |workspace, _window, cx| {
-            let editors: Vec<_> = workspace.items_of_type::<editor::Editor>(cx).collect();
-            if let Some(editor) = editors.into_iter().next() {
-                editor.update(cx, |editor, cx| {
-                    editor.set_diff_review_comments_expanded(false, cx);
-                });
-            }
-        })
-        .log_err();
-
-    for _ in 0..3 {
-        cx.advance_clock(Duration::from_millis(100));
-        cx.run_until_parked();
-    }
-
-    // Frame 6: collapsed
-    cx.record_frame(window, &mut recorder)?;
-
-    recorder.export_gif(&output_path)?;
-
-    // Cleanup
-    workspace_window
-        .update(cx, |workspace, _window, cx| {
-            let project = workspace.project().clone();
-            project.update(cx, |project, cx| {
-                let ids: Vec<_> = project.worktrees(cx).map(|wt| wt.read(cx).id()).collect();
-                for id in ids {
-                    project.remove_worktree(id, cx);
-                }
-            });
-        })
-        .log_err();
-    cx.run_until_parked();
-    cx.update_window(window, |_, window, _| window.remove_window()).log_err();
-    cx.run_until_parked();
-
-    Ok(output_path)
 }
 
 /// Records a demo GIF of the file picker: workspace → open picker → type → close.
@@ -1650,8 +1437,8 @@ fn run_settings_ui_subpage_visual_tests(
 fn run_diff_review_visual_tests(
     app_state: Arc<AppState>,
     cx: &mut VisualTestAppContext,
-    update_baseline: bool,
-) -> Result<TestResult> {
+    session: &mut VisualTestSession,
+) -> Result<()> {
     // Create a temporary directory with test files and a real git repo
     let temp_dir = tempfile::tempdir()?;
     let temp_path = temp_dir.keep();
@@ -1787,12 +1574,7 @@ import { AiPaneTabContext } from 'context';
     cx.run_until_parked();
 
     // Capture Test 1: Diff with flag enabled
-    let test1_result = run_visual_test(
-        "diff_review_button_enabled",
-        workspace_window.into(),
-        cx,
-        update_baseline,
-    )?;
+    session.assert_snapshot("diff_review_button_enabled", workspace_window.into(), cx)?;
 
     // Test 2: Diff view with feature flag disabled
     // Disable the feature flag
@@ -1811,12 +1593,7 @@ import { AiPaneTabContext } from 'context';
     }
 
     // Capture Test 2: Diff with flag disabled
-    let test2_result = run_visual_test(
-        "diff_review_button_disabled",
-        workspace_window.into(),
-        cx,
-        update_baseline,
-    )?;
+    session.assert_snapshot("diff_review_button_disabled", workspace_window.into(), cx)?;
 
     // Test 3: Regular editor with flag enabled (should NOT show button)
     // Re-enable the feature flag
@@ -1882,12 +1659,7 @@ import { AiPaneTabContext } from 'context';
     cx.run_until_parked();
 
     // Capture Test 3: Regular editor with flag enabled (no button)
-    let test3_result = run_visual_test(
-        "diff_review_button_regular_editor",
-        regular_window.into(),
-        cx,
-        update_baseline,
-    )?;
+    session.assert_snapshot("diff_review_button_regular_editor", regular_window.into(), cx)?;
 
     // Test 4: Show the diff review overlay on the regular editor
     regular_window
@@ -1916,12 +1688,7 @@ import { AiPaneTabContext } from 'context';
     cx.run_until_parked();
 
     // Capture Test 4: Regular editor with overlay shown
-    let test4_result = run_visual_test(
-        "diff_review_overlay_shown",
-        regular_window.into(),
-        cx,
-        update_baseline,
-    )?;
+    session.assert_snapshot("diff_review_overlay_shown", regular_window.into(), cx)?;
 
     // Test 5: Type text into the diff review prompt and submit it
     // First, get the prompt editor from the overlay and type some text
@@ -1959,12 +1726,7 @@ import { AiPaneTabContext } from 'context';
     cx.run_until_parked();
 
     // Capture Test 5: Diff review overlay with typed text
-    let test5_result = run_visual_test(
-        "diff_review_overlay_with_text",
-        regular_window.into(),
-        cx,
-        update_baseline,
-    )?;
+    session.assert_snapshot("diff_review_overlay_with_text", regular_window.into(), cx)?;
 
     // Test 6: Submit a comment to store it locally
     regular_window
@@ -1993,12 +1755,7 @@ import { AiPaneTabContext } from 'context';
     cx.run_until_parked();
 
     // Capture Test 6: Overlay with one stored comment
-    let test6_result = run_visual_test(
-        "diff_review_one_comment",
-        regular_window.into(),
-        cx,
-        update_baseline,
-    )?;
+    session.assert_snapshot("diff_review_one_comment", regular_window.into(), cx)?;
 
     // Test 7: Add more comments to show multiple comments expanded
     regular_window
@@ -2040,11 +1797,10 @@ import { AiPaneTabContext } from 'context';
     cx.run_until_parked();
 
     // Capture Test 7: Overlay with multiple comments expanded
-    let test7_result = run_visual_test(
+    session.assert_snapshot(
         "diff_review_multiple_comments_expanded",
         regular_window.into(),
         cx,
-        update_baseline,
     )?;
 
     // Test 8: Collapse the comments section
@@ -2074,12 +1830,7 @@ import { AiPaneTabContext } from 'context';
     cx.run_until_parked();
 
     // Capture Test 8: Comments collapsed
-    let test8_result = run_visual_test(
-        "diff_review_comments_collapsed",
-        regular_window.into(),
-        cx,
-        update_baseline,
-    )?;
+    session.assert_snapshot("diff_review_comments_collapsed", regular_window.into(), cx)?;
 
     // Clean up: remove worktrees to stop background scanning
     workspace_window
@@ -2115,28 +1866,7 @@ import { AiPaneTabContext } from 'context';
         cx.run_until_parked();
     }
 
-    // Return combined result
-    let all_results = [
-        &test1_result,
-        &test2_result,
-        &test3_result,
-        &test4_result,
-        &test5_result,
-        &test6_result,
-        &test7_result,
-        &test8_result,
-    ];
-
-    // Combine results: if any test updated a baseline, return BaselineUpdated;
-    // otherwise return Passed. The exhaustive match ensures the compiler
-    // verifies we handle all TestResult variants.
-    let result = all_results
-        .iter()
-        .fold(TestResult::Passed, |acc, r| match r {
-            TestResult::Passed => acc,
-            TestResult::BaselineUpdated(p) => TestResult::BaselineUpdated(p.clone()),
-        });
-    Ok(result)
+    Ok(())
 }
 
 /// A stub AgentServer for visual testing that returns a pre-programmed connection.

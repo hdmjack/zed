@@ -60,16 +60,7 @@ cargo test --workspace
 
 ## Visual Regression Tests
 
-Zed includes visual regression tests that capture screenshots of real Zed windows and compare them against baseline images. These tests require macOS with Screen Recording permission.
-
-### Prerequisites
-
-You must grant Screen Recording permission to your terminal:
-
-1. Run the visual test runner once - macOS will prompt for permission
-2. Or manually: System Settings > Privacy & Security > Screen Recording
-3. Enable your terminal app (e.g., Terminal.app, iTerm2, Ghostty)
-4. Restart your terminal after granting permission
+Zed includes visual regression tests that capture screenshots of real Zed windows and compare them against baseline images. Tests render directly to a Metal texture — no Screen Recording permission required.
 
 ### Running Visual Tests
 
@@ -93,8 +84,6 @@ UPDATE_BASELINE=1 cargo run -p zed --bin zed_visual_test_runner --features visua
 git checkout -
 ```
 
-This creates baselines that reflect the current expected UI.
-
 #### Updating Baselines
 
 When UI changes are intentional, update the baseline images after your changes:
@@ -105,6 +94,21 @@ UPDATE_BASELINE=1 cargo run -p zed --bin zed_visual_test_runner --features visua
 
 > **Note:** In the future, baselines may be stored externally. For now, they
 > remain local-only to keep the git repository lightweight.
+
+### Generating Demo GIFs
+
+To add GIF support to a visual test:
+
+1. Change the function signature from `update_baseline: bool` to `session: &mut VisualTestSession`
+2. Replace each `run_visual_test(name, window, cx, update_baseline)?` call with `session.assert_snapshot(name, window, cx)?`
+
+Then run with `RECORD_GIF=1` to produce a GIF instead of comparing baselines:
+
+```sh
+RECORD_GIF=1 cargo run -p zed --bin zed_visual_test_runner --features visual-tests
+```
+
+Output lands in `target/visual_tests/`.
 
 ## Troubleshooting
 
