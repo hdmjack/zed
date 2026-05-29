@@ -24,12 +24,20 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffBase {
     Head,
-    Merge { base_ref: SharedString },
+    Merge {
+        base_ref: SharedString,
+        #[serde(default)]
+        head_ref: Option<SharedString>,
+    },
 }
 
 impl DiffBase {
     pub fn is_merge_base(&self) -> bool {
         matches!(self, DiffBase::Merge { .. })
+    }
+
+    pub fn has_explicit_head(&self) -> bool {
+        matches!(self, DiffBase::Merge { head_ref: Some(_), .. })
     }
 }
 
@@ -179,7 +187,7 @@ impl BranchDiff {
                 } else if let Some(repo) = this.repo.as_ref() {
                     repo.update(cx, |repo, _| {
                         if let Some(branch) = &repo.branch
-                            && let DiffBase::Merge { base_ref } = &this.diff_base
+                            && let DiffBase::Merge { base_ref, .. } = &this.diff_base
                             && let Some(commit) = branch.most_recent_commit.as_ref()
                             && &branch.ref_name == base_ref
                             && this.base_commit.as_ref() != Some(&commit.sha)
@@ -300,7 +308,7 @@ impl BranchDiff {
 
     pub async fn reload_tree_diff(this: WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
         let task = this.update(cx, |this, cx| {
-            let DiffBase::Merge { base_ref } = this.diff_base.clone() else {
+            let DiffBase::Merge { base_ref, head_ref } = this.diff_base.clone() else {
                 return None;
             };
             let Some(repo) = this.repo.as_ref() else {
@@ -311,7 +319,7 @@ impl BranchDiff {
                 Some(repo.diff_tree(
                     DiffTreeType::MergeBase {
                         base: base_ref,
-                        head: "HEAD".into(),
+                        head: head_ref.unwrap_or_else(|| "HEAD".into()),
                     },
                     cx,
                 ))
@@ -351,6 +359,9 @@ impl BranchDiff {
                     .as_ref()
                     .and_then(|t| t.entries.get(&item.repo_path))
                     .cloned();
+                if self.diff_base.has_explicit_head() && branch_diff.is_none() {
+                    continue;
+                }
                 let Some(status) = self.merge_statuses(Some(item.status), branch_diff.as_ref())
                 else {
                     continue;

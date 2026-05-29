@@ -1,0 +1,19 @@
+sync:
+  mode: one-way-replica
+  ignore:
+    paths:
+      - .git
+      # Build output is large and remote-owned; the remote rebuilds target/ from synced source.
+      - target
+
+# returnFlow: rsync these patterns from remote→local after `bica run`, so a remote build's
+# artifacts land locally. Pulls the runnable binary plus any sidecar dylibs it links at runtime.
+# Note: a dev binary resolves assets relative to its build-time path — keep the remote workspace
+# path (.bica/local.yml) equal to this repo's local absolute path so the pulled binary runs locally.
+returnFlow:
+  paths:
+    - "target/debug/zed"
+    - "target/debug/*.dylib"
+
+bica:
+  pluginMode: auto

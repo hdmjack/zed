@@ -136,6 +136,7 @@ pub struct SettingsContent {
     pub file_finder: Option<FileFinderSettingsContent>,
 
     pub git_panel: Option<GitPanelSettingsContent>,
+    pub review_panel: Option<ReviewPanelSettingsContent>,
 
     pub tabs: Option<ItemSettingsContent>,
     pub tab_bar: Option<TabBarSettingsContent>,
@@ -636,6 +637,24 @@ pub struct CallSettingsContent {
     ///
     /// Default: false
     pub share_on_join: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct ReviewPanelSettingsContent {
+    /// Whether to show the review panel button in the status bar.
+    ///
+    /// Default: true
+    pub button: Option<bool>,
+    /// Where to dock the review panel. Can be 'left' or 'right'.
+    ///
+    /// Default: right
+    pub dock: Option<DockPosition>,
+    /// Default width of the review panel in pixels.
+    ///
+    /// Default: 360
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
+    pub default_width: Option<f32>,
 }
 
 #[with_fallible_options]

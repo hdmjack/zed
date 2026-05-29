@@ -1,0 +1,12 @@
+sync:
+  zed:
+    mode: one-way-replica
+    ignore:
+      paths:
+        - .git
+        - target
+        - target/debug/zed
+        - target/debug/*.dylib
+    alpha: /Users/haakonjack/code/zed
+    beta: mini:~/code/zed
+

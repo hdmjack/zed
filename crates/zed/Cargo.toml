@@ -176,6 +176,7 @@ remote.workspace = true
 repl.workspace = true
 reqwest.workspace = true
 reqwest_client.workspace = true
+review_ui.workspace = true
 rope.workspace = true
 search.workspace = true
 serde.workspace = true
