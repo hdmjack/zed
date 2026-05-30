@@ -316,6 +316,9 @@ impl BranchDiff {
             let DiffBase::Merge { base_ref, head_ref } = this.diff_base.clone() else {
                 return None;
             };
+            // PR review (explicit head) collapses renames into one entry, matching
+            // GitHub's file list. Local branch diffs keep the simpler add/delete view.
+            let find_renames = head_ref.is_some();
             let Some(repo) = this.repo.as_ref() else {
                 this.tree_diff.take();
                 return None;
@@ -325,6 +328,7 @@ impl BranchDiff {
                     DiffTreeType::MergeBase {
                         base: base_ref,
                         head: head_ref.unwrap_or_else(|| "HEAD".into()),
+                        find_renames,
                     },
                     cx,
                 ))

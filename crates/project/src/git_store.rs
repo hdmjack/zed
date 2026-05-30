@@ -3428,11 +3428,13 @@ impl GitStore {
             DiffTreeType::MergeBase {
                 base: request.payload.base.into(),
                 head: request.payload.head.into(),
+                find_renames: false,
             }
         } else {
             DiffTreeType::Since {
                 base: request.payload.base.into(),
                 head: request.payload.head.into(),
+                find_renames: false,
             }
         };
 

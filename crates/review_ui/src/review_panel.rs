@@ -573,6 +573,7 @@ impl ReviewPanel {
         // For a PR, diff the recorded commit SHAs (matches GitHub's three-dot
         // "Files changed"). Falling back to branch names would resolve the base
         // to the local — often stale — branch tip and show a huge bogus diff.
+        let find_renames = self.selected_pr.is_some();
         let (base, head) = if let Some(pr) = &self.selected_pr {
             (pr.base_sha.clone(), pr.head_sha.clone())
         } else {
@@ -584,7 +585,14 @@ impl ReviewPanel {
         };
 
         let diff_rx = repo.update(cx, |repo, cx| {
-            repo.diff_tree(DiffTreeType::MergeBase { base, head }, cx)
+            repo.diff_tree(
+                DiffTreeType::MergeBase {
+                    base,
+                    head,
+                    find_renames,
+                },
+                cx,
+            )
         });
 
         cx.spawn(async move |this, cx| {

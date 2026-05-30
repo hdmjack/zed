@@ -502,10 +502,14 @@ pub enum DiffTreeType {
     MergeBase {
         base: SharedString,
         head: SharedString,
+        /// Detect renames/copies and report them as a single `Modified` entry
+        /// on the new path, instead of a delete + add pair.
+        find_renames: bool,
     },
     Since {
         base: SharedString,
         head: SharedString,
+        find_renames: bool,
     },
 }
 
@@ -543,37 +547,55 @@ impl FromStr for TreeDiff {
     fn from_str(s: &str) -> Result<Self> {
         let mut fields = s.split('\0');
         let mut parsed = HashMap::default();
-        while let Some((status, path)) = fields.next().zip(fields.next()) {
-            let path = RepoPath::from_rel_path(RelPath::unix(path)?);
+        // Each record is `:<mode> <mode> <old_sha> <new_sha> <status>` followed
+        // by one path (A/M/D) or two paths (R/C: old then new). With
+        // `--find-renames`, a rename arrives as a single `R` record whose new
+        // path we record as `Modified` (so a rename collapses to one entry).
+        while let Some(status) = fields.next() {
+            if status.is_empty() {
+                continue;
+            }
 
-            let mut fields = status.split(" ").skip(2);
-            let old_sha = fields
+            let mut meta = status.split(' ').skip(2);
+            let old_sha = meta
                 .next()
                 .ok_or_else(|| anyhow!("expected to find old_sha"))?
                 .to_owned()
                 .parse()?;
-            let _new_sha = fields
+            let _new_sha = meta
                 .next()
                 .ok_or_else(|| anyhow!("expected to find new_sha"))?;
-            let status = fields
+            let status_byte = *meta
                 .next()
-                .and_then(|s| {
-                    if s.len() == 1 {
-                        s.as_bytes().first()
-                    } else {
-                        None
-                    }
-                })
+                .and_then(|s| s.as_bytes().first())
                 .ok_or_else(|| anyhow!("expected to find status"))?;
 
-            let result = match StatusCode::from_byte(*status)? {
-                StatusCode::Modified => TreeDiffStatus::Modified { old: old_sha },
-                StatusCode::Added => TreeDiffStatus::Added,
-                StatusCode::Deleted => TreeDiffStatus::Deleted { old: old_sha },
-                _status => continue,
-            };
-
-            parsed.insert(path, result);
+            match StatusCode::from_byte(status_byte)? {
+                StatusCode::Renamed | StatusCode::Copied => {
+                    // Two paths follow: the old path, then the new path.
+                    let _old_path = fields
+                        .next()
+                        .ok_or_else(|| anyhow!("expected to find rename old path"))?;
+                    let new_path = fields
+                        .next()
+                        .ok_or_else(|| anyhow!("expected to find rename new path"))?;
+                    let path = RepoPath::from_rel_path(RelPath::unix(new_path)?);
+                    parsed.insert(path, TreeDiffStatus::Modified { old: old_sha });
+                }
+                code => {
+                    let path = fields
+                        .next()
+                        .ok_or_else(|| anyhow!("expected to find path"))?;
+                    let path = RepoPath::from_rel_path(RelPath::unix(path)?);
+                    let result = match code {
+                        StatusCode::Modified => TreeDiffStatus::Modified { old: old_sha },
+                        StatusCode::Added => TreeDiffStatus::Added,
+                        StatusCode::Deleted => TreeDiffStatus::Deleted { old: old_sha },
+                        _ => continue,
+                    };
+                    parsed.insert(path, result);
+                }
+            }
         }
 
         Ok(Self { entries: parsed })

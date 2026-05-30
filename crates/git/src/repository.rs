@@ -1759,15 +1759,23 @@ impl GitRepository for RealGitRepository {
             OsString::from("diff-tree"),
             OsString::from("-r"),
             OsString::from("-z"),
-            OsString::from("--no-renames"),
         ];
+        let find_renames = match &request {
+            DiffTreeType::MergeBase { find_renames, .. }
+            | DiffTreeType::Since { find_renames, .. } => *find_renames,
+        };
+        args.push(OsString::from(if find_renames {
+            "--find-renames"
+        } else {
+            "--no-renames"
+        }));
         match request {
-            DiffTreeType::MergeBase { base, head } => {
+            DiffTreeType::MergeBase { base, head, .. } => {
                 args.push("--merge-base".into());
                 args.push(OsString::from(base.as_str()));
                 args.push(OsString::from(head.as_str()));
             }
-            DiffTreeType::Since { base, head } => {
+            DiffTreeType::Since { base, head, .. } => {
                 args.push(OsString::from(base.as_str()));
                 args.push(OsString::from(head.as_str()));
             }
