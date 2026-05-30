@@ -7,17 +7,22 @@ use git::{
     status::{DiffTreeType, FileStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus},
 };
 use gpui::{
-    App, AsyncApp, AsyncWindowContext, Context, Entity, EventEmitter, SharedString, Subscription,
-    Task, WeakEntity, Window,
+    App, AppContext as _, AsyncApp, AsyncWindowContext, Context, Entity, EventEmitter, SharedString,
+    Subscription, Task, WeakEntity, Window,
 };
 
-use language::Buffer;
+use language::{
+    Buffer, Capability, DiskState, LanguageRegistry, LineEnding, ReplicaId, Rope, TextBuffer,
+};
+use std::path::PathBuf;
+use std::sync::Arc;
 use text::BufferId;
 use util::ResultExt;
+use util::{paths::PathStyle, rel_path::RelPath};
 use ztracing::instrument;
 
 use crate::{
-    Project,
+    Project, WorktreeId,
     git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
 
@@ -349,7 +354,14 @@ impl BranchDiff {
             return output;
         }
 
-        self.project.update(cx, |_project, cx| {
+        let head_ref = match &self.diff_base {
+            DiffBase::Merge { head_ref, .. } => head_ref.clone(),
+            DiffBase::Head => None,
+        };
+
+        self.project.update(cx, |project, cx| {
+            let work_dir = repo.read(cx).work_directory_abs_path.clone();
+            let language_registry = project.languages().clone();
             let mut seen = HashSet::default();
 
             for item in repo.read(cx).cached_status() {
@@ -375,7 +387,16 @@ impl BranchDiff {
                 else {
                     continue;
                 };
-                let task = Self::load_buffer(branch_diff, project_path, repo.clone(), cx);
+                let task = Self::load_buffer(
+                    branch_diff,
+                    project_path,
+                    item.repo_path.clone(),
+                    repo.clone(),
+                    head_ref.clone(),
+                    work_dir.clone(),
+                    language_registry.clone(),
+                    cx,
+                );
 
                 output.push(DiffBuffer {
                     repo_path: item.repo_path.clone(),
@@ -395,8 +416,16 @@ impl BranchDiff {
                 let Some(project_path) = repo.read(cx).repo_path_to_project_path(&path, cx) else {
                     continue;
                 };
-                let task =
-                    Self::load_buffer(Some(branch_diff.clone()), project_path, repo.clone(), cx);
+                let task = Self::load_buffer(
+                    Some(branch_diff.clone()),
+                    project_path,
+                    path.clone(),
+                    repo.clone(),
+                    head_ref.clone(),
+                    work_dir.clone(),
+                    language_registry.clone(),
+                    cx,
+                );
 
                 let file_status = diff_status_to_file_status(branch_diff);
 
@@ -414,10 +443,59 @@ impl BranchDiff {
     fn load_buffer(
         branch_diff: Option<git::status::TreeDiffStatus>,
         project_path: crate::ProjectPath,
+        repo_path: RepoPath,
         repo: Entity<Repository>,
+        head_ref: Option<SharedString>,
+        work_dir: Arc<std::path::Path>,
+        language_registry: Arc<LanguageRegistry>,
         cx: &Context<'_, Project>,
     ) -> Task<Result<(Entity<Buffer>, Entity<BufferDiff>)>> {
+        let worktree_id = project_path.worktree_id;
         let task = cx.spawn(async move |project, cx| {
+            // PR / explicit-head mode: show the file at the head commit (read-only),
+            // diffed against the base blob, without touching the working tree.
+            if let Some(head_sha) = head_ref {
+                let repo_path_str = repo_path.as_std_path().to_string_lossy().to_string();
+                let output = smol::process::Command::new("git")
+                    .current_dir(work_dir.as_ref())
+                    .args(["show", &format!("{}:{}", head_sha, repo_path_str)])
+                    .output()
+                    .await?;
+                let head_text = if output.status.success() {
+                    String::from_utf8_lossy(&output.stdout).into_owned()
+                } else {
+                    String::new()
+                };
+
+                let (base_oid, is_deleted) = match &branch_diff {
+                    Some(git::status::TreeDiffStatus::Modified { old }) => (Some(*old), false),
+                    Some(git::status::TreeDiffStatus::Deleted { old }) => (Some(*old), true),
+                    _ => (None, false),
+                };
+                let base_text = if let Some(oid) = base_oid {
+                    repo.update(cx, |repo, cx| repo.load_blob_content(oid, cx))
+                        .await
+                        .ok()
+                } else {
+                    None
+                };
+
+                let display_name = repo_path_str
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let file: Arc<dyn language::File> = Arc::new(GitBlobFile {
+                    path: repo_path,
+                    worktree_id,
+                    is_deleted,
+                    display_name,
+                });
+                let buffer = build_blob_buffer(head_text, file, &language_registry, cx).await?;
+                let diff = build_blob_diff(base_text, &buffer, &language_registry, cx).await?;
+                return Ok((buffer, diff));
+            }
+
             let buffer = project
                 .update(cx, |project, cx| project.open_buffer(project_path, cx))?
                 .await?;
@@ -471,4 +549,129 @@ pub struct DiffBuffer {
     pub repo_path: RepoPath,
     pub file_status: FileStatus,
     pub load: Task<Result<(Entity<Buffer>, Entity<BufferDiff>)>>,
+}
+
+/// A synthetic `File` for a read-only buffer backed by a git blob (a file at a
+/// specific commit), used when reviewing a PR head that isn't checked out.
+struct GitBlobFile {
+    path: RepoPath,
+    worktree_id: WorktreeId,
+    is_deleted: bool,
+    display_name: String,
+}
+
+impl language::File for GitBlobFile {
+    fn as_local(&self) -> Option<&dyn language::LocalFile> {
+        None
+    }
+
+    fn disk_state(&self) -> DiskState {
+        DiskState::Historic {
+            was_deleted: self.is_deleted,
+        }
+    }
+
+    fn path_style(&self, _: &App) -> PathStyle {
+        PathStyle::local()
+    }
+
+    fn path(&self) -> &Arc<RelPath> {
+        self.path.as_ref()
+    }
+
+    fn full_path(&self, _: &App) -> PathBuf {
+        self.path.as_std_path().to_path_buf()
+    }
+
+    fn file_name<'a>(&'a self, _: &'a App) -> &'a str {
+        self.display_name.as_ref()
+    }
+
+    fn worktree_id(&self, _: &App) -> WorktreeId {
+        self.worktree_id
+    }
+
+    fn to_proto(&self, _cx: &App) -> language::proto::File {
+        unimplemented!()
+    }
+
+    fn is_private(&self) -> bool {
+        false
+    }
+
+    fn can_open(&self) -> bool {
+        true
+    }
+}
+
+/// Build a read-only buffer holding `text` (a git blob's content), with a
+/// synthetic `File` so syntax highlighting and the path resolve.
+async fn build_blob_buffer(
+    mut text: String,
+    file: Arc<dyn language::File>,
+    language_registry: &Arc<LanguageRegistry>,
+    cx: &mut AsyncApp,
+) -> Result<Entity<Buffer>> {
+    let line_ending = LineEnding::detect(&text);
+    LineEnding::normalize(&mut text);
+    let text = Rope::from(text);
+    let language = cx.update(|cx| language_registry.language_for_file(&file, Some(&text), cx));
+    let language = if let Some(language) = language {
+        language_registry
+            .load_language(&language)
+            .await
+            .ok()
+            .and_then(|e| e.log_err())
+    } else {
+        None
+    };
+    let buffer = cx.new(|cx| {
+        let buffer = TextBuffer::new_normalized(
+            ReplicaId::LOCAL,
+            cx.entity_id().as_non_zero_u64().into(),
+            line_ending,
+            text,
+        );
+        let mut buffer = Buffer::build(buffer, Some(file), Capability::ReadOnly);
+        buffer.set_language_async(language, cx);
+        buffer
+    });
+    Ok(buffer)
+}
+
+/// Build a `BufferDiff` of `buffer` against `old_text` (the base blob).
+async fn build_blob_diff(
+    mut old_text: Option<String>,
+    buffer: &Entity<Buffer>,
+    language_registry: &Arc<LanguageRegistry>,
+    cx: &mut AsyncApp,
+) -> Result<Entity<BufferDiff>> {
+    if let Some(old_text) = &mut old_text {
+        LineEnding::normalize(old_text);
+    }
+
+    let language = cx.update(|cx| buffer.read(cx).language().cloned());
+    let buffer = cx.update(|cx| buffer.read(cx).snapshot());
+
+    let diff = cx.new(|cx| BufferDiff::new(&buffer.text, cx));
+
+    let update = diff
+        .update(cx, |diff, cx| {
+            diff.update_diff(
+                buffer.text.clone(),
+                old_text.map(|old_text| Arc::from(old_text.as_str())),
+                Some(true),
+                language.clone(),
+                cx,
+            )
+        })
+        .await;
+
+    diff.update(cx, |diff, cx| {
+        diff.language_changed(language, Some(language_registry.clone()), cx);
+        diff.set_snapshot(update, &buffer.text, cx)
+    })
+    .await;
+
+    Ok(diff)
 }

@@ -493,11 +493,21 @@ impl ReviewPanel {
 
         let work_dir = repo.read(cx).snapshot().work_directory_abs_path;
         let refspec = format!("pull/{}/head", pr_number);
+        // Also fetch the base branch so the PR's base SHA (and the merge-base
+        // with the head) is present locally for the diff.
+        let base_ref = self
+            .selected_pr
+            .as_ref()
+            .map(|pr| pr.base_ref.to_string());
 
         self.pr_ref_fetch_task = Some(cx.spawn(async move |this, cx| {
+            let mut args = vec!["fetch".to_string(), "origin".to_string(), refspec.clone()];
+            if let Some(base_ref) = &base_ref {
+                args.push(base_ref.clone());
+            }
             let output = smol::process::Command::new("git")
                 .current_dir(work_dir.as_ref())
-                .args(["fetch", "origin", &refspec])
+                .args(&args)
                 .output()
                 .await?;
 
@@ -560,12 +570,17 @@ impl ReviewPanel {
             return;
         };
 
-        let Some(base) = self.base_branch.clone() else {
-            return;
-        };
-
-        let Some(head) = self.head_branch.clone() else {
-            return;
+        // For a PR, diff the recorded commit SHAs (matches GitHub's three-dot
+        // "Files changed"). Falling back to branch names would resolve the base
+        // to the local — often stale — branch tip and show a huge bogus diff.
+        let (base, head) = if let Some(pr) = &self.selected_pr {
+            (pr.base_sha.clone(), pr.head_sha.clone())
+        } else {
+            let (Some(base), Some(head)) = (self.base_branch.clone(), self.head_branch.clone())
+            else {
+                return;
+            };
+            (base, head)
         };
 
         let diff_rx = repo.update(cx, |repo, cx| {
@@ -723,17 +738,65 @@ impl ReviewPanel {
 
     fn inject_for_multibuffer_editor(
         &mut self,
-        _editor: &Entity<Editor>,
-        _review_view: &Entity<ReviewView>,
-        _cx: &mut Context<Self>,
+        editor: &Entity<Editor>,
+        review_view: &Entity<ReviewView>,
+        cx: &mut Context<Self>,
     ) {
-        // TODO(review-panel): Re-implement inline comment injection for multibuffer
-        // (combined diff) editors against the current MultiBuffer API. The previous
-        // implementation relied on `MultiBuffer::paths`/`excerpts_for_path`,
-        // `MultiBufferSnapshot::excerpts` yielding `(ExcerptId, BufferSnapshot, range)`
-        // tuples, and `Anchor::in_buffer`, all of which have since changed. This is the
-        // gutter/inline editor integration tracked as Phase 10. Singleton-buffer
-        // injection still works via `inject_pr_comments_into_editor`.
+        let multibuffer = editor.read(cx).buffer().clone();
+        let snapshot = multibuffer.read(cx).snapshot(cx);
+        let buffers = multibuffer.read(cx).all_buffers();
+
+        let mut blocks = Vec::new();
+        for buffer in buffers {
+            let (file_path, buffer_snapshot) = {
+                let buffer = buffer.read(cx);
+                let Some(file) = buffer.file() else {
+                    continue;
+                };
+                let file_path = SharedString::from(
+                    file.path().as_std_path().to_string_lossy().to_string(),
+                );
+                (file_path, buffer.snapshot())
+            };
+
+            let comments = review_view.read(cx).comments_for_file(&file_path);
+            if comments.is_empty() {
+                continue;
+            }
+            let threads = Self::build_comment_threads(&comments, cx);
+            let max_row = buffer_snapshot.max_point().row;
+
+            for (line, thread_comments) in threads {
+                let row = line.saturating_sub(1);
+                if row > max_row {
+                    continue;
+                }
+                // Lift the buffer-relative position into a multibuffer anchor. Returns
+                // None when the line isn't inside a displayed excerpt (e.g. a comment
+                // on an unchanged line not shown in the diff) — skip those.
+                let text_anchor = buffer_snapshot.anchor_before(Point::new(row, 0));
+                let Some(anchor) = snapshot.anchor_in_excerpt(text_anchor) else {
+                    continue;
+                };
+                let height = Self::estimate_block_height(&thread_comments);
+                blocks.push(BlockProperties {
+                    placement: BlockPlacement::Below(anchor),
+                    height: Some(height),
+                    style: BlockStyle::Flex,
+                    render: Arc::new(move |cx| render_pr_comment_block(thread_comments.clone(), cx)),
+                    priority: 0,
+                });
+            }
+        }
+
+        if blocks.is_empty() {
+            return;
+        }
+
+        let editor_id = editor.entity_id();
+        let block_ids = editor.update(cx, |editor, cx| editor.insert_blocks(blocks, None, cx));
+        self.injected_comment_blocks
+            .insert(editor_id, (editor.downgrade(), block_ids));
     }
 
     fn inject_pr_comments_into_editor(
@@ -935,7 +998,7 @@ impl ReviewPanel {
                 };
 
                 if let Some(pr) = self.selected_pr.as_ref() {
-                    let base_ref = pr.base_ref.clone();
+                    let base_ref = pr.base_sha.clone();
                     let head_ref = Some(pr.head_sha.clone());
                     workspace.update(cx, |workspace, cx| {
                         git_ui::project_diff::ProjectDiff::deploy_merge_diff(
