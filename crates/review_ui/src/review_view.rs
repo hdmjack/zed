@@ -156,9 +156,48 @@ impl ReviewView {
         cx.notify();
     }
 
+    // Mutators: every change to data or expansion state goes through one of
+    // these so `rebuild()` can never be forgotten. Do NOT write the underlying
+    // fields directly elsewhere.
+
+    fn begin_loading_comments(&mut self, cx: &mut Context<Self>) {
+        self.pr_comments_loading = true;
+        self.rebuild();
+        cx.notify();
+    }
+
+    fn set_pr_comments(&mut self, comments: Vec<ReviewComment>, cx: &mut Context<Self>) {
+        self.pr_comments = comments;
+        self.pr_comments_loading = false;
+        self.rebuild();
+        cx.notify();
+    }
+
+    fn set_pr_api_files(&mut self, files: Vec<PullRequestFile>, cx: &mut Context<Self>) {
+        self.pr_api_files = files;
+        self.rebuild();
+        cx.notify();
+    }
+
+    fn toggle_directory(&mut self, path: SharedString, cx: &mut Context<Self>) {
+        if !self.expanded_dirs.remove(&path) {
+            self.expanded_dirs.insert(path);
+        }
+        self.rebuild();
+        cx.notify();
+    }
+
+    fn toggle_comment_file(&mut self, path: SharedString, cx: &mut Context<Self>) {
+        if !self.expanded_comment_files.remove(&path) {
+            self.expanded_comment_files.insert(path);
+        }
+        self.rebuild();
+        cx.notify();
+    }
+
     /// Recompute all cached state (file entries, grouped comments, display
-    /// entries, and the flattened `visible_rows`). Call whenever the underlying
-    /// data or expansion state changes — NOT per frame.
+    /// entries, and the flattened `visible_rows`). Private — reach it only via
+    /// the mutator methods above so it can't be skipped.
     fn rebuild(&mut self) {
         self.file_entries = self.compute_file_entries();
 
@@ -357,17 +396,12 @@ impl ReviewView {
             return;
         };
 
-        self.pr_comments_loading = true;
-        self.rebuild();
-        cx.notify();
+        self.begin_loading_comments(cx);
 
         cx.spawn(async move |this, cx| {
             let comments = provider.fetch_reviews(&owner, &repo, pr_number).await?;
             this.update(cx, |this, cx| {
-                this.pr_comments = comments;
-                this.pr_comments_loading = false;
-                this.rebuild();
-                cx.notify();
+                this.set_pr_comments(comments, cx);
             })?;
             anyhow::Ok(())
         })
@@ -390,9 +424,7 @@ impl ReviewView {
                 .fetch_pull_request_files(&owner, &repo, pr_number)
                 .await?;
             this.update(cx, |this, cx| {
-                this.pr_api_files = files;
-                this.rebuild();
-                cx.notify();
+                this.set_pr_api_files(files, cx);
             })?;
             anyhow::Ok(())
         })
@@ -589,7 +621,6 @@ impl ReviewView {
                     IconName::Folder
                 };
                 let dir_path = path.clone();
-                let was_expanded = *expanded;
                 h_flex()
                     .id(SharedString::from(format!("rv_dir_{}", ix)))
                     .px_2()
@@ -614,13 +645,7 @@ impl ReviewView {
                         ),
                     )
                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                        if was_expanded {
-                            this.expanded_dirs.remove(&dir_path);
-                        } else {
-                            this.expanded_dirs.insert(dir_path.clone());
-                        }
-                        this.rebuild();
-                        cx.notify();
+                        this.toggle_directory(dir_path.clone(), cx);
                     }))
                     .into_any_element()
             }
@@ -719,13 +744,7 @@ impl ReviewView {
                                         .color(Color::Muted),
                                 )
                                 .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    if this.expanded_comment_files.contains(&path_for_toggle) {
-                                        this.expanded_comment_files.remove(&path_for_toggle);
-                                    } else {
-                                        this.expanded_comment_files.insert(path_for_toggle.clone());
-                                    }
-                                    this.rebuild();
-                                    cx.notify();
+                                    this.toggle_comment_file(path_for_toggle.clone(), cx);
                                 })),
                         )
                     });
