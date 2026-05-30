@@ -1,6 +1,9 @@
 use crate::review_provider::{PullRequestInfo, PullRequestState, ReviewProvider};
 use editor::{Editor, EditorEvent};
-use gpui::{Anchor, Context, Entity, EventEmitter, Render, SharedString, Window};
+use gpui::{
+    Anchor, AnyElement, Context, Entity, EventEmitter, Render, SharedString,
+    UniformListScrollHandle, Window, px, uniform_list,
+};
 use std::sync::Arc;
 use ui::{
     Color, ContextMenu, IconButton, IconName, IconSize, IntoElement, Label, LabelSize,
@@ -12,15 +15,22 @@ pub enum PullRequestListEvent {
     Selected(PullRequestInfo),
 }
 
+/// Fixed (two-line) row height so the PR list can be virtualized.
+const ROW_HEIGHT: f32 = 44.0;
+
 pub struct PullRequestList {
     provider: Option<Arc<dyn ReviewProvider>>,
     remote_owner: Option<String>,
     remote_repo: Option<String>,
     pull_requests: Vec<PullRequestInfo>,
+    /// `pull_requests` filtered by the current search query — cached so `render`
+    /// does no per-frame filtering.
+    filtered: Vec<PullRequestInfo>,
     loading: bool,
     filter: PullRequestState,
     filter_menu_handle: PopoverMenuHandle<ContextMenu>,
     search_editor: Entity<Editor>,
+    scroll_handle: UniformListScrollHandle,
 }
 
 impl EventEmitter<PullRequestListEvent> for PullRequestList {}
@@ -39,8 +49,9 @@ impl PullRequestList {
             editor
         });
 
-        cx.subscribe_in(&search_editor, window, |_this, _editor, event: &EditorEvent, _window, cx| {
+        cx.subscribe_in(&search_editor, window, |this, _editor, event: &EditorEvent, _window, cx| {
             if matches!(event, EditorEvent::BufferEdited { .. }) {
+                this.recompute_filtered(cx);
                 cx.notify();
             }
         })
@@ -51,11 +62,31 @@ impl PullRequestList {
             remote_owner,
             remote_repo,
             pull_requests: Vec::new(),
+            filtered: Vec::new(),
             loading: false,
             filter: PullRequestState::Open,
             filter_menu_handle: PopoverMenuHandle::default(),
             search_editor,
+            scroll_handle: UniformListScrollHandle::new(),
         }
+    }
+
+    fn recompute_filtered(&mut self, cx: &mut Context<Self>) {
+        let query = self.search_editor.read(cx).text(cx).to_lowercase();
+        self.filtered = self
+            .pull_requests
+            .iter()
+            .filter(|pr| {
+                if query.is_empty() {
+                    return true;
+                }
+                let query_trimmed = query.trim_start_matches('#');
+                pr.number.to_string().contains(query_trimmed)
+                    || pr.author.to_lowercase().contains(&query)
+                    || pr.title.to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect();
     }
 
     pub fn set_provider(
@@ -101,6 +132,7 @@ impl PullRequestList {
             this.update(cx, |this, cx| {
                 this.pull_requests = pull_requests;
                 this.loading = false;
+                this.recompute_filtered(cx);
                 cx.notify();
             })?;
             anyhow::Ok(())
@@ -113,6 +145,49 @@ impl PullRequestList {
             self.filter = state;
             self.load_pull_requests(cx);
         }
+    }
+}
+
+impl PullRequestList {
+    fn render_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let pr = self.filtered[ix].clone();
+        let number = pr.number;
+        let title = pr.title.clone();
+        let author = pr.author.clone();
+        let updated = pr.updated_at.clone();
+        h_flex()
+            .id(SharedString::from(format!("pr_{}", number)))
+            .px_2()
+            .h(px(ROW_HEIGHT))
+            .items_center()
+            .gap_2()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+            .child(
+                Label::new(format!("#{}", number))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                v_flex()
+                    .overflow_x_hidden()
+                    .child(
+                        Label::new(title.to_string())
+                            .size(LabelSize::Small)
+                            .single_line(),
+                    )
+                    .child(
+                        Label::new(format!("by {} · {}", author, updated))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .single_line(),
+                    ),
+            )
+            .on_click(cx.listener(move |_this, _event, _window, cx| {
+                cx.emit(PullRequestListEvent::Selected(pr.clone()));
+            }))
+            .into_any_element()
     }
 }
 
@@ -151,40 +226,18 @@ impl Render for PullRequestList {
                 .into_any_element();
         }
 
-        let query = self
-            .search_editor
-            .read(cx)
-            .text(cx)
-            
-            .to_lowercase();
-
-        let filtered: Vec<_> = self
-            .pull_requests
-            .iter()
-            .filter(|pr| {
-                if query.is_empty() {
-                    return true;
-                }
-                let query_trimmed = query.trim_start_matches('#');
-                pr.number.to_string().contains(query_trimmed)
-                    || pr.author.to_lowercase().contains(&query)
-                    || pr.title.to_lowercase().contains(&query)
-            })
-            .cloned()
-            .collect();
-
         let filter_label = match &self.filter {
             PullRequestState::Open => "Open",
             PullRequestState::Closed => "Closed",
             PullRequestState::Merged => "Merged",
             PullRequestState::All => "All",
         };
+        let filtered_count = self.filtered.len();
         let weak_list = cx.weak_entity();
 
         v_flex()
             .id("review-pr-list")
             .size_full()
-            .overflow_scroll()
             .child(
                 h_flex()
                     .px_2()
@@ -254,51 +307,22 @@ impl Render for PullRequestList {
             )
             .child(
                 h_flex().px_2().pb_1().child(
-                    Label::new(format!("{} {} pull requests", filtered.len(), filter_label))
+                    Label::new(format!("{} {} pull requests", filtered_count, filter_label))
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 ),
             )
-            .children(filtered.into_iter().map(|pr| {
-                let number = pr.number;
-                let title = pr.title.clone();
-                let author = pr.author.clone();
-                let updated = pr.updated_at.clone();
-
-                h_flex()
-                    .id(SharedString::from(format!("pr_{}", number)))
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .rounded_md()
-                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                    .child(
-                        Label::new(format!("#{}", number))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        v_flex()
-                            .overflow_x_hidden()
-                            .child(
-                                Label::new(title.to_string())
-                                    .size(LabelSize::Small)
-                                    .single_line(),
-                            )
-                            .child(
-                                Label::new(format!("by {} · {}", author, updated))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .single_line(),
-                            ),
-                    )
-                    .on_click({
-                        cx.listener(move |this, _event, _window, cx| {
-                            cx.emit(PullRequestListEvent::Selected(pr.clone()));
-                            let _ = this;
-                        })
-                    })
-            }))
+            .child(
+                uniform_list(
+                    "pr-list-rows",
+                    filtered_count,
+                    cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                        range.map(|ix| this.render_row(ix, cx)).collect()
+                    }),
+                )
+                .flex_1()
+                .track_scroll(&self.scroll_handle),
+            )
             .into_any_element()
     }
 }

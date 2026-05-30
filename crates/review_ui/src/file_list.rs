@@ -1,7 +1,10 @@
 use collections::{BTreeMap, HashSet};
 use git::repository::RepoPath;
 use git::status::{TreeDiff, TreeDiffStatus};
-use gpui::{Context, EventEmitter, Render, SharedString, Window, actions, px};
+use gpui::{
+    AnyElement, Context, EventEmitter, Render, SharedString, UniformListScrollHandle, Window,
+    actions, px, uniform_list,
+};
 use ui::{
     Color, Icon, IconName, IconSize, IntoElement, Label, LabelSize, div, h_flex, prelude::*,
     v_flex,
@@ -14,6 +17,8 @@ actions!(
 );
 
 const TREE_INDENT: f32 = 16.0;
+/// Fixed row height so the list can be virtualized with `uniform_list`.
+const ROW_HEIGHT: f32 = 28.0;
 
 pub enum FileListEvent {
     OpenFileDiff(RepoPath),
@@ -57,6 +62,7 @@ pub struct FileList {
     view_mode: ViewMode,
     expanded_dirs: HashSet<SharedString>,
     display_entries: Vec<DisplayEntry>,
+    scroll_handle: UniformListScrollHandle,
 }
 
 impl EventEmitter<FileListEvent> for FileList {}
@@ -180,6 +186,7 @@ impl FileList {
             view_mode: ViewMode::Flat,
             expanded_dirs: HashSet::default(),
             display_entries: Vec::new(),
+            scroll_handle: UniformListScrollHandle::new(),
         };
         this.rebuild_display_entries();
         this
@@ -401,6 +408,138 @@ impl FileList {
     }
 }
 
+impl FileList {
+    /// Render a single row by index. Virtualized via `uniform_list`, so this is
+    /// only called for the visible range.
+    fn render_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let info_color = cx.theme().status().info;
+        let selected_bg_alpha = 0.08;
+        let is_selected = self.selected_entry == Some(ix);
+        let bg = if is_selected {
+            info_color.alpha(selected_bg_alpha)
+        } else {
+            cx.theme().colors().ghost_element_background
+        };
+        let hover_bg = if is_selected {
+            info_color.alpha(selected_bg_alpha + 0.04)
+        } else {
+            cx.theme().colors().ghost_element_hover
+        };
+
+        match &self.display_entries[ix] {
+            DisplayEntry::Directory {
+                path,
+                name,
+                depth,
+                expanded,
+            } => {
+                let folder_icon = if *expanded {
+                    IconName::FolderOpen
+                } else {
+                    IconName::Folder
+                };
+                let dir_path = path.clone();
+                let was_expanded = *expanded;
+                let depth = *depth;
+                let name = name.clone();
+                h_flex()
+                    .id(SharedString::from(format!("dir_{}", ix)))
+                    .px_2()
+                    .h(px(ROW_HEIGHT))
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(bg)
+                    .hover(move |style| style.bg(hover_bg))
+                    .pl(px(depth as f32 * TREE_INDENT + 8.0))
+                    .child(
+                        Icon::new(folder_icon)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div().overflow_x_hidden().child(
+                            Label::new(name.to_string())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .single_line(),
+                        ),
+                    )
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.selected_entry = Some(ix);
+                        this.toggle_directory(&dir_path, was_expanded);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }
+            DisplayEntry::File {
+                entry_index,
+                depth,
+                display_name,
+            } => {
+                let Some((path, status)) = self.entries.get(*entry_index) else {
+                    return div().into_any_element();
+                };
+                let (icon, color) = match status {
+                    TreeDiffStatus::Added => (IconName::Plus, Color::Created),
+                    TreeDiffStatus::Modified { .. } => (IconName::Pencil, Color::Modified),
+                    TreeDiffStatus::Deleted { .. } => (IconName::Dash, Color::Deleted),
+                };
+                let is_viewed = self.viewed_files.contains(path);
+                let label_color = if is_viewed {
+                    Color::Muted
+                } else {
+                    Color::Default
+                };
+                let path = path.clone();
+                let indent = *depth as f32 * TREE_INDENT + 8.0;
+                let display_name = display_name.clone();
+
+                h_flex()
+                    .id(SharedString::from(format!("file_entry_{}", ix)))
+                    .px_2()
+                    .h(px(ROW_HEIGHT))
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .bg(bg)
+                    .hover(move |style| style.bg(hover_bg))
+                    .pl(px(indent))
+                    .when(!is_viewed, |row| {
+                        row.child(
+                            div()
+                                .flex_none()
+                                .w(px(6.))
+                                .h(px(6.))
+                                .rounded_full()
+                                .bg(info_color),
+                        )
+                    })
+                    .when(is_viewed, |row| {
+                        row.child(div().flex_none().w(px(6.)).h(px(6.)))
+                    })
+                    .child(Icon::new(icon).size(IconSize::Small).color(color))
+                    .child(
+                        div().overflow_x_hidden().child(
+                            Label::new(display_name.to_string())
+                                .size(LabelSize::Small)
+                                .color(label_color)
+                                .single_line(),
+                        ),
+                    )
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.viewed_files.insert(path.clone());
+                        this.selected_entry = Some(ix);
+                        cx.emit(FileListEvent::OpenFileDiff(path.clone()));
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }
+        }
+    }
+}
+
 impl Render for FileList {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.entries.is_empty() {
@@ -441,148 +580,11 @@ impl Render for FileList {
             file_count, added, deleted, modified, viewed_count, file_count
         );
 
-        let info_color = cx.theme().status().info;
-        let selected_bg_alpha = 0.08;
-
-        let mut file_rows: Vec<gpui::AnyElement> = Vec::new();
-
-        for (ix, entry) in self.display_entries.iter().enumerate() {
-            let is_selected = self.selected_entry == Some(ix);
-            let bg = if is_selected {
-                info_color.alpha(selected_bg_alpha)
-            } else {
-                cx.theme().colors().ghost_element_background
-            };
-            let hover_bg = if is_selected {
-                info_color.alpha(selected_bg_alpha + 0.04)
-            } else {
-                cx.theme().colors().ghost_element_hover
-            };
-
-            match entry {
-                DisplayEntry::Directory {
-                    path,
-                    name,
-                    depth,
-                    expanded,
-                } => {
-                    let folder_icon = if *expanded {
-                        IconName::FolderOpen
-                    } else {
-                        IconName::Folder
-                    };
-                    let dir_path = path.clone();
-
-                    file_rows.push(
-                        h_flex()
-                            .id(SharedString::from(format!("dir_{}", ix)))
-                            .px_2()
-                            .py_1()
-                            .gap_2()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .bg(bg)
-                            .hover(move |style| style.bg(hover_bg))
-                            .pl(px(*depth as f32 * TREE_INDENT + 8.0))
-                            .child(
-                                Icon::new(folder_icon)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                div().overflow_x_hidden().child(
-                                    Label::new(name.to_string())
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .single_line(),
-                                ),
-                            )
-                            .on_click({
-                                let dir_path = dir_path.clone();
-                                let was_expanded = *expanded;
-                                cx.listener(move |this, _event, _window, cx| {
-                                    this.selected_entry = Some(ix);
-                                    this.toggle_directory(&dir_path, was_expanded);
-                                    cx.notify();
-                                })
-                            })
-                            .into_any_element(),
-                    );
-                }
-                DisplayEntry::File {
-                    entry_index,
-                    depth,
-                    display_name,
-                } => {
-                    let Some((path, status)) = self.entries.get(*entry_index) else {
-                        continue;
-                    };
-                    let (icon, color) = match status {
-                        TreeDiffStatus::Added => (IconName::Plus, Color::Created),
-                        TreeDiffStatus::Modified { .. } => (IconName::Pencil, Color::Modified),
-                        TreeDiffStatus::Deleted { .. } => (IconName::Dash, Color::Deleted),
-                    };
-                    let is_viewed = self.viewed_files.contains(path);
-                    let label_color = if is_viewed {
-                        Color::Muted
-                    } else {
-                        Color::Default
-                    };
-                    let path = path.clone();
-                    let indent = *depth as f32 * TREE_INDENT + 8.0;
-                    let display_name = display_name.clone();
-
-                    file_rows.push(
-                        h_flex()
-                            .id(SharedString::from(format!("file_entry_{}", ix)))
-                            .px_2()
-                            .py_1()
-                            .gap_2()
-                            .rounded_md()
-                            .bg(bg)
-                            .hover(move |style| style.bg(hover_bg))
-                            .pl(px(indent))
-                            .when(!is_viewed, |row| {
-                                row.child(
-                                    div()
-                                        .flex_none()
-                                        .w(px(6.))
-                                        .h(px(6.))
-                                        .rounded_full()
-                                        .bg(cx.theme().status().info),
-                                )
-                            })
-                            .when(is_viewed, |row| {
-                                row.child(div().flex_none().w(px(6.)).h(px(6.)))
-                            })
-                            .child(Icon::new(icon).size(IconSize::Small).color(color))
-                            .child(
-                                div().overflow_x_hidden().child(
-                                    Label::new(display_name.to_string())
-                                        .size(LabelSize::Small)
-                                        .color(label_color)
-                                        .single_line(),
-                                ),
-                            )
-                            .on_click({
-                                let path = path.clone();
-                                cx.listener(move |this, _event, _window, cx| {
-                                    this.viewed_files.insert(path.clone());
-                                    this.selected_entry = Some(ix);
-                                    cx.emit(FileListEvent::OpenFileDiff(path.clone()));
-                                    cx.notify();
-                                })
-                            })
-                            .into_any_element(),
-                    );
-                }
-            }
-        }
+        let row_count = self.display_entries.len();
 
         v_flex()
             .id("review-file-list")
             .size_full()
-            .overflow_scroll()
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::confirm))
@@ -606,7 +608,17 @@ impl Render for FileList {
                         .color(Color::Muted),
                 ),
             )
-            .children(file_rows)
+            .child(
+                uniform_list(
+                    "file-list-rows",
+                    row_count,
+                    cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                        range.map(|ix| this.render_row(ix, cx)).collect()
+                    }),
+                )
+                .flex_1()
+                .track_scroll(&self.scroll_handle),
+            )
             .into_any_element()
     }
 }

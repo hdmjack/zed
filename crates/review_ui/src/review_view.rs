@@ -1,4 +1,3 @@
-use crate::comment_card::CommentCard;
 use crate::file_list::{DisplayEntry, ViewMode, build_file_tree, flatten_file_tree};
 use crate::review_provider::{
     FileChangeStatus, PullRequestFile, PullRequestInfo, ReviewComment, ReviewProvider, ReviewStatus,
@@ -7,7 +6,10 @@ use collections::{HashMap, HashSet};
 use editor::Editor;
 use git::repository::RepoPath;
 use git::status::{TreeDiff, TreeDiffStatus};
-use gpui::{Anchor, Context, Entity, EventEmitter, Focusable, Render, SharedString, Window, px};
+use gpui::{
+    Anchor, AnyElement, Context, Entity, EventEmitter, Focusable, Render, SharedString,
+    UniformListScrollHandle, Window, px, uniform_list,
+};
 use std::sync::Arc;
 use ui::{
     ButtonLike, ButtonSize, Color, ContextMenu, ElevationIndex, Icon, IconButton, IconName,
@@ -21,6 +23,9 @@ pub enum ReviewViewEvent {
 }
 
 const TREE_INDENT: f32 = 16.0;
+/// Fixed row height so the review list can be virtualized with `uniform_list`,
+/// which requires uniform item heights.
+const ROW_HEIGHT: f32 = 28.0;
 
 pub struct ReviewView {
     provider: Option<Arc<dyn ReviewProvider>>,
@@ -39,6 +44,45 @@ pub struct ReviewView {
     expanded_dirs: HashSet<SharedString>,
     display_entries: Vec<DisplayEntry>,
     expanded_comment_files: HashSet<SharedString>,
+    scroll_handle: UniformListScrollHandle,
+    // Cached per-data-change so `render` does no per-frame recompute.
+    file_entries: Vec<(SharedString, Option<FileChangeStatus>, u32, u32)>,
+    file_comments: HashMap<SharedString, Vec<ReviewComment>>,
+    general_comments: Vec<ReviewComment>,
+    visible_rows: Vec<RowKind>,
+}
+
+/// One flattened, virtualizable row in the review scroll area.
+enum RowKind {
+    Directory {
+        path: SharedString,
+        name: SharedString,
+        depth: usize,
+        expanded: bool,
+    },
+    File {
+        entry_index: usize,
+        depth: usize,
+        display_name: SharedString,
+        path: SharedString,
+        comment_count: usize,
+        comments_expanded: bool,
+    },
+    Comment {
+        path: SharedString,
+        depth: usize,
+        is_reply: bool,
+        line: Option<u32>,
+        author: SharedString,
+        body_preview: SharedString,
+    },
+    GeneralHeader {
+        count: usize,
+    },
+    GeneralComment {
+        comment: ReviewComment,
+    },
+    Loading,
 }
 
 impl EventEmitter<ReviewViewEvent> for ReviewView {}
@@ -80,6 +124,11 @@ impl ReviewView {
             expanded_dirs: HashSet::default(),
             display_entries: Vec::new(),
             expanded_comment_files: HashSet::default(),
+            scroll_handle: UniformListScrollHandle::new(),
+            file_entries: Vec::new(),
+            file_comments: HashMap::default(),
+            general_comments: Vec::new(),
+            visible_rows: Vec::new(),
         };
         this.load_pr_comments(pr_number, cx);
         this.load_pr_api_files(pr_number, cx);
@@ -90,7 +139,7 @@ impl ReviewView {
         self.tree_diff = tree_diff.map(|td| TreeDiff {
             entries: td.entries.clone(),
         });
-        self.rebuild_display_entries();
+        self.rebuild();
         cx.notify();
     }
 
@@ -103,19 +152,36 @@ impl ReviewView {
             ViewMode::Flat => ViewMode::Tree,
             ViewMode::Tree => ViewMode::Flat,
         };
-        self.rebuild_display_entries();
+        self.rebuild();
         cx.notify();
     }
 
-    fn rebuild_display_entries(&mut self) {
-        self.display_entries.clear();
+    /// Recompute all cached state (file entries, grouped comments, display
+    /// entries, and the flattened `visible_rows`). Call whenever the underlying
+    /// data or expansion state changes — NOT per frame.
+    fn rebuild(&mut self) {
+        self.file_entries = self.compute_file_entries();
 
-        let file_entries = self.collect_file_entries();
+        let mut file_comments: HashMap<SharedString, Vec<ReviewComment>> = HashMap::default();
+        let mut general_comments: Vec<ReviewComment> = Vec::new();
+        for comment in &self.pr_comments {
+            if let Some(path) = &comment.path {
+                file_comments
+                    .entry(path.clone())
+                    .or_default()
+                    .push(comment.clone());
+            } else {
+                general_comments.push(comment.clone());
+            }
+        }
+        self.file_comments = file_comments;
+        self.general_comments = general_comments;
 
+        let mut display_entries = Vec::new();
         match self.view_mode {
             ViewMode::Flat => {
-                for (ix, (path, _, _, _)) in file_entries.iter().enumerate() {
-                    self.display_entries.push(DisplayEntry::File {
+                for (ix, (path, _, _, _)) in self.file_entries.iter().enumerate() {
+                    display_entries.push(DisplayEntry::File {
                         entry_index: ix,
                         depth: 0,
                         display_name: path.clone(),
@@ -123,18 +189,95 @@ impl ReviewView {
                 }
             }
             ViewMode::Tree => {
-                let paths: Vec<(usize, &str)> = file_entries
+                let paths: Vec<(usize, &str)> = self
+                    .file_entries
                     .iter()
                     .enumerate()
                     .map(|(ix, (path, _, _, _))| (ix, path.as_ref()))
                     .collect();
                 let tree = build_file_tree(&paths);
-                flatten_file_tree(&tree, 0, &self.expanded_dirs, &mut self.display_entries);
+                flatten_file_tree(&tree, 0, &self.expanded_dirs, &mut display_entries);
             }
         }
+        self.display_entries = display_entries;
+
+        let mut rows = Vec::new();
+        for entry in &self.display_entries {
+            match entry {
+                DisplayEntry::Directory {
+                    path,
+                    name,
+                    depth,
+                    expanded,
+                } => rows.push(RowKind::Directory {
+                    path: path.clone(),
+                    name: name.clone(),
+                    depth: *depth,
+                    expanded: *expanded,
+                }),
+                DisplayEntry::File {
+                    entry_index,
+                    depth,
+                    display_name,
+                } => {
+                    let Some((path, _, _, _)) = self.file_entries.get(*entry_index) else {
+                        continue;
+                    };
+                    let path = path.clone();
+                    let comments = self.file_comments.get(&path);
+                    let comment_count = comments.map(|c| c.len()).unwrap_or(0);
+                    let comments_expanded = self.expanded_comment_files.contains(&path);
+                    rows.push(RowKind::File {
+                        entry_index: *entry_index,
+                        depth: *depth,
+                        display_name: display_name.clone(),
+                        path: path.clone(),
+                        comment_count,
+                        comments_expanded,
+                    });
+                    if comments_expanded {
+                        if let Some(comments) = comments {
+                            for comment in comments {
+                                let body_preview: String = comment
+                                    .body
+                                    .chars()
+                                    .take(60)
+                                    .collect::<String>()
+                                    .lines()
+                                    .next()
+                                    .unwrap_or("")
+                                    .to_string();
+                                rows.push(RowKind::Comment {
+                                    path: path.clone(),
+                                    depth: *depth,
+                                    is_reply: comment.reply_to.is_some(),
+                                    line: comment.line,
+                                    author: comment.author.clone(),
+                                    body_preview: body_preview.into(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !self.general_comments.is_empty() {
+            rows.push(RowKind::GeneralHeader {
+                count: self.general_comments.len(),
+            });
+            for comment in &self.general_comments {
+                rows.push(RowKind::GeneralComment {
+                    comment: comment.clone(),
+                });
+            }
+        }
+        if self.pr_comments_loading {
+            rows.push(RowKind::Loading);
+        }
+        self.visible_rows = rows;
     }
 
-    fn collect_file_entries(&self) -> Vec<(SharedString, Option<FileChangeStatus>, u32, u32)> {
+    fn compute_file_entries(&self) -> Vec<(SharedString, Option<FileChangeStatus>, u32, u32)> {
         if !self.pr_api_files.is_empty() {
             self.pr_api_files
                 .iter()
@@ -215,6 +358,7 @@ impl ReviewView {
         };
 
         self.pr_comments_loading = true;
+        self.rebuild();
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -222,6 +366,7 @@ impl ReviewView {
             this.update(cx, |this, cx| {
                 this.pr_comments = comments;
                 this.pr_comments_loading = false;
+                this.rebuild();
                 cx.notify();
             })?;
             anyhow::Ok(())
@@ -246,7 +391,7 @@ impl ReviewView {
                 .await?;
             this.update(cx, |this, cx| {
                 this.pr_api_files = files;
-                this.rebuild_display_entries();
+                this.rebuild();
                 cx.notify();
             })?;
             anyhow::Ok(())
@@ -428,305 +573,299 @@ impl ReviewView {
     }
 }
 
+impl ReviewView {
+    /// Render a single cached row. Pure read of cached state — no recompute.
+    fn render_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        match &self.visible_rows[ix] {
+            RowKind::Directory {
+                path,
+                name,
+                depth,
+                expanded,
+            } => {
+                let folder_icon = if *expanded {
+                    IconName::FolderOpen
+                } else {
+                    IconName::Folder
+                };
+                let dir_path = path.clone();
+                let was_expanded = *expanded;
+                h_flex()
+                    .id(SharedString::from(format!("rv_dir_{}", ix)))
+                    .px_2()
+                    .h(px(ROW_HEIGHT))
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                    .pl(px(*depth as f32 * TREE_INDENT + 8.0))
+                    .child(
+                        Icon::new(folder_icon)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div().overflow_x_hidden().child(
+                            Label::new(name.to_string())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .single_line(),
+                        ),
+                    )
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        if was_expanded {
+                            this.expanded_dirs.remove(&dir_path);
+                        } else {
+                            this.expanded_dirs.insert(dir_path.clone());
+                        }
+                        this.rebuild();
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }
+            RowKind::File {
+                entry_index,
+                depth,
+                display_name,
+                path,
+                comment_count,
+                comments_expanded,
+            } => {
+                let (status, additions, deletions) = match self.file_entries.get(*entry_index) {
+                    Some((_, status, additions, deletions)) => {
+                        (status.clone(), *additions, *deletions)
+                    }
+                    None => (None, 0, 0),
+                };
+                let (icon, color) = match status {
+                    Some(FileChangeStatus::Added) => (IconName::Plus, Color::Created),
+                    Some(FileChangeStatus::Modified) => (IconName::Pencil, Color::Modified),
+                    Some(FileChangeStatus::Deleted) => (IconName::Dash, Color::Deleted),
+                    Some(FileChangeStatus::Renamed { .. }) => (IconName::ArrowRight, Color::Modified),
+                    None => (IconName::File, Color::Muted),
+                };
+                let indent = *depth as f32 * TREE_INDENT + 8.0;
+                let repo_path = RepoPath::new(path.as_ref()).ok();
+                let comment_count = *comment_count;
+                let comments_expanded = *comments_expanded;
+                let path_for_toggle = path.clone();
+                let display_name = display_name.clone();
+
+                let file_row = h_flex()
+                    .id(SharedString::from(format!("pr_file_{}", ix)))
+                    .px_2()
+                    .h(px(ROW_HEIGHT))
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                    .pl(px(indent))
+                    .child(Icon::new(icon).size(IconSize::Small).color(color))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .overflow_x_hidden()
+                            .gap_2()
+                            .child(
+                                Label::new(display_name.to_string())
+                                    .size(LabelSize::Small)
+                                    .single_line(),
+                            )
+                            .when(additions > 0, |el| {
+                                el.child(
+                                    Label::new(format!("+{}", additions))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Created),
+                                )
+                            })
+                            .when(deletions > 0, |el| {
+                                el.child(
+                                    Label::new(format!("-{}", deletions))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Deleted),
+                                )
+                            }),
+                    )
+                    .when(comment_count > 0, |row| {
+                        let chevron = if comments_expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        };
+                        row.child(
+                            h_flex()
+                                .id(SharedString::from(format!("comment_badge_{}", ix)))
+                                .flex_none()
+                                .gap_1()
+                                .px_1()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                .child(
+                                    Icon::new(IconName::Chat)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(comment_count.to_string())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Icon::new(chevron)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    if this.expanded_comment_files.contains(&path_for_toggle) {
+                                        this.expanded_comment_files.remove(&path_for_toggle);
+                                    } else {
+                                        this.expanded_comment_files.insert(path_for_toggle.clone());
+                                    }
+                                    this.rebuild();
+                                    cx.notify();
+                                })),
+                        )
+                    });
+
+                let file_row = if let Some(repo_path) = repo_path {
+                    file_row.on_click(cx.listener(move |_this, _event, _window, cx| {
+                        cx.emit(ReviewViewEvent::OpenFileDiff(repo_path.clone()));
+                    }))
+                } else {
+                    file_row
+                };
+                file_row.into_any_element()
+            }
+            RowKind::Comment {
+                path,
+                depth,
+                is_reply,
+                line,
+                author,
+                body_preview,
+            } => {
+                let indent = *depth as f32 * TREE_INDENT + 8.0;
+                let is_reply = *is_reply;
+                let line_label = line.map(|l| format!("at {} ", l)).unwrap_or_default();
+                let author = author.clone();
+                let body_preview = body_preview.clone();
+                let repo_path = RepoPath::new(path.as_ref()).ok();
+
+                let row = h_flex()
+                    .id(SharedString::from(format!("compact_comment_{}", ix)))
+                    .px_2()
+                    .h(px(ROW_HEIGHT))
+                    .items_center()
+                    .gap_1()
+                    .pl(px(indent + 16.0))
+                    .when(is_reply, |el| el.pl(px(indent + 32.0)))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                    .when(!line_label.is_empty(), |el| {
+                        el.child(
+                            Label::new(line_label)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Accent),
+                        )
+                    })
+                    .child(
+                        Label::new(format!("@{}", author))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Default),
+                    )
+                    .child(
+                        div().overflow_x_hidden().flex_1().child(
+                            Label::new(body_preview)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
+                        ),
+                    );
+
+                if let Some(repo_path) = repo_path {
+                    row.on_click(cx.listener(move |_this, _event, _window, cx| {
+                        cx.emit(ReviewViewEvent::OpenFileDiff(repo_path.clone()));
+                    }))
+                    .into_any_element()
+                } else {
+                    row.into_any_element()
+                }
+            }
+            RowKind::GeneralHeader { count } => h_flex()
+                .px_2()
+                .h(px(ROW_HEIGHT))
+                .items_center()
+                .child(
+                    Label::new(format!("General comments ({})", count))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            RowKind::GeneralComment { comment } => {
+                let body_preview: String = comment
+                    .body
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                h_flex()
+                    .px_2()
+                    .h(px(ROW_HEIGHT))
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Label::new(format!("@{}", comment.author))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Default),
+                    )
+                    .child(
+                        div().overflow_x_hidden().flex_1().child(
+                            Label::new(body_preview)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line(),
+                        ),
+                    )
+                    .into_any_element()
+            }
+            RowKind::Loading => h_flex()
+                .px_2()
+                .h(px(ROW_HEIGHT))
+                .items_center()
+                .child(
+                    Label::new("Loading comments...")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+        }
+    }
+}
+
 impl Render for ReviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pr_number = self.selected_pr.number;
         let pr_title = self.selected_pr.title.clone();
         let pr_author = self.selected_pr.author.clone();
-        let file_entries = self.collect_file_entries();
-        let file_count = file_entries.len();
+        let file_count = self.file_entries.len();
+        let row_count = self.visible_rows.len();
 
-        let mut file_comments: HashMap<SharedString, Vec<ReviewComment>> = HashMap::default();
-        let mut general_comments: Vec<ReviewComment> = Vec::new();
-        for comment in &self.pr_comments {
-            if let Some(path) = &comment.path {
-                file_comments
-                    .entry(path.clone())
-                    .or_default()
-                    .push(comment.clone());
-            } else {
-                general_comments.push(comment.clone());
-            }
-        }
-
-        let mut scrollable = v_flex()
-            .id("review-scrollable")
-            .flex_1()
-            .overflow_scroll()
-            .gap_1();
-
-        for (ix, entry) in self.display_entries.iter().enumerate() {
-            match entry {
-                DisplayEntry::Directory {
-                    path,
-                    name,
-                    depth,
-                    expanded,
-                } => {
-                    let folder_icon = if *expanded {
-                        IconName::FolderOpen
-                    } else {
-                        IconName::Folder
-                    };
-                    let dir_path = path.clone();
-                    let was_expanded = *expanded;
-
-                    scrollable = scrollable.child(
-                        h_flex()
-                            .id(SharedString::from(format!("rv_dir_{}", ix)))
-                            .px_2()
-                            .py_1()
-                            .gap_2()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                            .pl(px(*depth as f32 * TREE_INDENT + 8.0))
-                            .child(
-                                Icon::new(folder_icon)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                div().overflow_x_hidden().child(
-                                    Label::new(name.to_string())
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .single_line(),
-                                ),
-                            )
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
-                                if was_expanded {
-                                    this.expanded_dirs.remove(&dir_path);
-                                } else {
-                                    this.expanded_dirs.insert(dir_path.clone());
-                                }
-                                this.rebuild_display_entries();
-                                cx.notify();
-                            })),
-                    );
-                }
-                DisplayEntry::File {
-                    entry_index,
-                    depth,
-                    display_name,
-                } => {
-                    let Some((path, status, additions, deletions)) =
-                        file_entries.get(*entry_index)
-                    else {
-                        continue;
-                    };
-
-                    let (icon, color) = match status {
-                        Some(FileChangeStatus::Added) => (IconName::Plus, Color::Created),
-                        Some(FileChangeStatus::Modified) => (IconName::Pencil, Color::Modified),
-                        Some(FileChangeStatus::Deleted) => (IconName::Dash, Color::Deleted),
-                        Some(FileChangeStatus::Renamed { .. }) => {
-                            (IconName::ArrowRight, Color::Modified)
-                        }
-                        None => (IconName::File, Color::Muted),
-                    };
-
-                    let indent = *depth as f32 * TREE_INDENT + 8.0;
-                    let repo_path = RepoPath::new(path.as_ref()).ok();
-                    let comment_count = file_comments
-                        .get(path)
-                        .map(|c| c.len())
-                        .unwrap_or(0);
-                    let comments_expanded =
-                        self.expanded_comment_files.contains(path);
-                    let path_for_toggle = path.clone();
-
-                    let file_row = h_flex()
-                        .id(SharedString::from(format!("pr_file_{}", ix)))
-                        .px_2()
-                        .py_1()
-                        .gap_2()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                        .pl(px(indent))
-                        .child(Icon::new(icon).size(IconSize::Small).color(color))
-                        .child(
-                            h_flex()
-                                .flex_1()
-                                .overflow_x_hidden()
-                                .gap_2()
-                                .child(
-                                    Label::new(display_name.to_string())
-                                        .size(LabelSize::Small)
-                                        .single_line(),
-                                )
-                                .when(*additions > 0, |el| {
-                                    el.child(
-                                        Label::new(format!("+{}", additions))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Created),
-                                    )
-                                })
-                                .when(*deletions > 0, |el| {
-                                    el.child(
-                                        Label::new(format!("-{}", deletions))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Deleted),
-                                    )
-                                }),
-                        )
-                        .when(comment_count > 0, |row| {
-                            let chevron = if comments_expanded {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            };
-                            row.child(
-                                h_flex()
-                                    .id(SharedString::from(format!("comment_badge_{}", ix)))
-                                    .flex_none()
-                                    .gap_1()
-                                    .px_1()
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .hover(|style| style.bg(cx.theme().colors().element_hover))
-                                    .child(
-                                        Icon::new(IconName::Chat)
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        Label::new(comment_count.to_string())
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        Icon::new(chevron)
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _event, _window, cx| {
-                                            if this
-                                                .expanded_comment_files
-                                                .contains(&path_for_toggle)
-                                            {
-                                                this.expanded_comment_files
-                                                    .remove(&path_for_toggle);
-                                            } else {
-                                                this.expanded_comment_files
-                                                    .insert(path_for_toggle.clone());
-                                            }
-                                            cx.notify();
-                                        },
-                                    )),
-                            )
-                        });
-
-                    let file_row = if let Some(repo_path) = repo_path {
-                        file_row.on_click(cx.listener(move |_this, _event, _window, cx| {
-                            cx.emit(ReviewViewEvent::OpenFileDiff(repo_path.clone()));
-                        }))
-                    } else {
-                        file_row
-                    };
-
-                    scrollable = scrollable.child(file_row);
-
-                    if comments_expanded {
-                        if let Some(comments) = file_comments.get(path) {
-                            for (comment_ix, comment) in comments.iter().enumerate() {
-                                let is_reply = comment.reply_to.is_some();
-                                let line_label = comment
-                                    .line
-                                    .map(|l| format!("at {} ", l))
-                                    .unwrap_or_default();
-                                let body_preview: String = comment
-                                    .body
-                                    .chars()
-                                    .take(60)
-                                    .collect::<String>()
-                                    .lines()
-                                    .next()
-                                    .unwrap_or("")
-                                    .to_string();
-                                let comment_repo_path =
-                                    RepoPath::new(path.as_ref()).ok();
-
-                                let row = h_flex()
-                                    .id(SharedString::from(format!(
-                                        "compact_comment_{}_{}", ix, comment_ix
-                                    )))
-                                    .px_2()
-                                    .py_0p5()
-                                    .gap_1()
-                                    .pl(px(indent + 16.0))
-                                    .when(is_reply, |el| el.pl(px(indent + 32.0)))
-                                    .rounded_sm()
-                                    .cursor_pointer()
-                                    .hover(|style| {
-                                        style.bg(cx.theme().colors().ghost_element_hover)
-                                    })
-                                    .when(!line_label.is_empty(), |el| {
-                                        el.child(
-                                            Label::new(line_label)
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Accent),
-                                        )
-                                    })
-                                    .child(
-                                        Label::new(format!("@{}", comment.author))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Default),
-                                    )
-                                    .child(
-                                        div().overflow_x_hidden().flex_1().child(
-                                            Label::new(body_preview)
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted)
-                                                .single_line(),
-                                        ),
-                                    );
-
-                                let row = if let Some(ref repo_path) = comment_repo_path {
-                                    let repo_path = repo_path.clone();
-                                    row.on_click(cx.listener(
-                                        move |_this, _event, _window, cx| {
-                                            cx.emit(ReviewViewEvent::OpenFileDiff(
-                                                repo_path.clone(),
-                                            ));
-                                        },
-                                    ))
-                                } else {
-                                    row
-                                };
-
-                                scrollable = scrollable.child(row);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !general_comments.is_empty() {
-            scrollable = scrollable.child(
-                h_flex().px_2().pt_2().child(
-                    Label::new(format!("General comments ({})", general_comments.len()))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-            );
-            for comment in &general_comments {
-                scrollable = scrollable.child(CommentCard::new(comment.clone()));
-            }
-        }
-
-        if self.pr_comments_loading {
-            scrollable = scrollable.child(
-                h_flex().px_2().py_1().child(
-                    Label::new("Loading comments...")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-            );
-        }
+        let scrollable = uniform_list(
+            "review-rows",
+            row_count,
+            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                range.map(|ix| this.render_row(ix, cx)).collect()
+            }),
+        )
+        .flex_1()
+        .track_scroll(&self.scroll_handle);
 
         v_flex()
             .id("review-thread")
