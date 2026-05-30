@@ -6,8 +6,8 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    Color, ContextMenu, IconButton, IconName, IconSize, IntoElement, Label, LabelSize,
-    PopoverMenuHandle, Tooltip, div, h_flex, prelude::*, v_flex,
+    Color, CommonAnimationExt, ContextMenu, Icon, IconButton, IconName, IconSize, IntoElement,
+    Label, LabelSize, PopoverMenuHandle, Tooltip, div, h_flex, prelude::*, v_flex,
 };
 use ui::PopoverMenu;
 
@@ -213,7 +213,14 @@ impl Render for PullRequestList {
                 .size_full()
                 .justify_center()
                 .items_center()
-                .child(Label::new("Loading pull requests...").color(Color::Muted))
+                .gap_2()
+                .child(
+                    Icon::new(IconName::ArrowCircle)
+                        .size(IconSize::Small)
+                        .color(Color::Muted)
+                        .with_rotate_animation(2),
+                )
+                .child(Label::new("Loading pull requests…").color(Color::Muted))
                 .into_any_element();
         }
 
