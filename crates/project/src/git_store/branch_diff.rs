@@ -292,6 +292,12 @@ impl BranchDiff {
         }
     }
 
+    /// Recompute the diff. Useful after the underlying commits become available
+    /// locally (e.g. once a PR ref finishes fetching).
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.spawn_reload_tree_diff(cx);
+    }
+
     fn spawn_reload_tree_diff(&mut self, cx: &mut Context<Self>) {
         if !self.diff_base.is_merge_base() {
             return;

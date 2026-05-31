@@ -211,11 +211,15 @@ impl ProjectDiff {
 
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
-            if let Some(path) = project_path {
-                existing.update(cx, |diff, cx| {
+            // Reload in case the underlying commits have since been fetched (the
+            // tab may have opened before the PR ref was available locally).
+            existing.update(cx, |diff, cx| {
+                diff.branch_diff
+                    .update(cx, |branch_diff, cx| branch_diff.reload(cx));
+                if let Some(path) = project_path {
                     diff.move_to_project_path(&path, window, cx);
-                });
-            }
+                }
+            });
             return;
         }
 

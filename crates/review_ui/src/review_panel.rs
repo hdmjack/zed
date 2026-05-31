@@ -58,6 +58,8 @@ enum PendingAction {
     OpenDiff(RepoPath),
     OpenLocal(RepoPath),
     SelectPullRequest(PullRequestInfo),
+    /// Open the whole PR's combined diff (all files) in the editor.
+    OpenPrDiff,
 }
 
 pub struct ReviewPanel {
@@ -524,6 +526,10 @@ impl ReviewPanel {
 
             this.update(cx, |this, cx| {
                 this.load_diff(cx);
+                // Auto-open the PR's combined diff in the editor (flushed in
+                // render, where the Window is available).
+                this.pending_action = Some(PendingAction::OpenPrDiff);
+                cx.notify();
             })?;
             anyhow::Ok(())
         }));
@@ -1022,6 +1028,21 @@ impl ReviewPanel {
                     window.dispatch_action(Box::new(git_ui::project_diff::BranchDiff), cx);
                 }
             }
+            PendingAction::OpenPrDiff => {
+                let Some(workspace) = self._workspace.upgrade() else {
+                    return;
+                };
+                let Some(pr) = self.selected_pr.as_ref() else {
+                    return;
+                };
+                let base_ref = pr.base_sha.clone();
+                let head_ref = Some(pr.head_sha.clone());
+                workspace.update(cx, |workspace, cx| {
+                    git_ui::project_diff::ProjectDiff::deploy_merge_diff(
+                        workspace, base_ref, head_ref, None, window, cx,
+                    );
+                });
+            }
             PendingAction::OpenLocal(path) => {
                 let Some(active_repo) = self.active_repository.as_ref() else {
                     return;
@@ -1042,6 +1063,18 @@ impl ReviewPanel {
             }
             PendingAction::SelectPullRequest(pr) => {
                 self.create_review_view(&pr, window, cx);
+                // Open the combined diff tab immediately. It starts empty and
+                // fills in once the PR ref finishes fetching (see fetch_pr_ref,
+                // which re-deploys to trigger a reload).
+                if let Some(workspace) = self._workspace.upgrade() {
+                    let base_ref = pr.base_sha.clone();
+                    let head_ref = Some(pr.head_sha.clone());
+                    workspace.update(cx, |workspace, cx| {
+                        git_ui::project_diff::ProjectDiff::deploy_merge_diff(
+                            workspace, base_ref, head_ref, None, window, cx,
+                        );
+                    });
+                }
             }
         }
     }
