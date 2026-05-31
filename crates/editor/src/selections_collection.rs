@@ -656,6 +656,16 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
             self.disjoint
                 .iter()
                 .filter(|selection| {
+                    // Drop selections whose anchors no longer resolve against the current
+                    // snapshot. These are stale anchors left behind when a buffer was removed
+                    // from the multibuffer (e.g. a synthetic PR blob buffer swapped out during
+                    // a diff refresh); keeping them would violate `change_with`'s invariant.
+                    if !self.snapshot.can_resolve(&selection.start)
+                        || !self.snapshot.can_resolve(&selection.end)
+                    {
+                        changed = true;
+                        return false;
+                    }
                     if let Some((selection_buffer_anchor, _)) =
                         self.snapshot.anchor_to_buffer_anchor(selection.start)
                     {
@@ -663,7 +673,8 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
                         changed |= should_remove;
                         !should_remove
                     } else {
-                        true
+                        changed = true;
+                        false
                     }
                 })
                 .cloned()
@@ -671,12 +682,9 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
         };
 
         if filtered_selections.is_empty() {
-            let buffer_snapshot = self.snapshot.buffer_snapshot();
-            let anchor = buffer_snapshot
-                .excerpts()
-                .find(|excerpt| excerpt.context.start.buffer_id == buffer_id)
-                .and_then(|excerpt| buffer_snapshot.anchor_in_excerpt(excerpt.context.start))
-                .unwrap_or_else(|| self.snapshot.anchor_before(MultiBufferOffset(0)));
+            // `Anchor::Min` always resolves and maps to the first visible row, so it is safe even
+            // when the first excerpt belongs to a now-folded buffer.
+            let anchor = Anchor::Min;
             self.collection.disjoint = Arc::from([Selection {
                 id: post_inc(&mut self.collection.next_selection_id),
                 start: anchor,
