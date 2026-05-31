@@ -1,20 +1,25 @@
 use crate::review_provider::ReviewComment;
+use gpui::Entity;
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use ui::{Color, IntoElement, Label, LabelSize, div, h_flex, prelude::*, v_flex};
 
 #[derive(IntoElement)]
 pub struct CommentCard {
     comment: ReviewComment,
+    /// The comment body, pre-parsed as markdown.
+    body: Entity<Markdown>,
 }
 
 impl CommentCard {
-    pub fn new(comment: ReviewComment) -> Self {
-        Self { comment }
+    pub fn new(comment: ReviewComment, body: Entity<Markdown>) -> Self {
+        Self { comment, body }
     }
 }
 
 impl RenderOnce for CommentCard {
-    fn render(self, _window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
+    fn render(self, window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
         let is_reply = self.comment.reply_to.is_some();
+        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
 
         let mut card = v_flex()
             .mx_2()
@@ -85,11 +90,7 @@ impl RenderOnce for CommentCard {
             );
         }
 
-        card = card.child(
-            Label::new(self.comment.body)
-                .size(LabelSize::XSmall)
-                .color(Color::Default),
-        );
+        card = card.child(MarkdownElement::new(self.body, markdown_style));
 
         card
     }

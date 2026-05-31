@@ -1,3 +1,4 @@
+use crate::comment_card::CommentCard;
 use crate::file_list::{DisplayEntry, ViewMode, build_file_tree, flatten_file_tree};
 use crate::review_provider::{
     FileChangeStatus, PullRequestFile, PullRequestInfo, ReviewComment, ReviewProvider, ReviewStatus,
@@ -6,9 +7,10 @@ use collections::{HashMap, HashSet};
 use editor::Editor;
 use git::repository::RepoPath;
 use git::status::{TreeDiff, TreeDiffStatus};
+use markdown::Markdown;
 use gpui::{
-    Anchor, AnyElement, Context, Entity, EventEmitter, Focusable, Render, SharedString,
-    UniformListScrollHandle, Window, px, uniform_list,
+    Anchor, AnyElement, Context, Entity, EventEmitter, Focusable, ListAlignment, ListState, Render,
+    SharedString, Window, list, px,
 };
 use std::sync::Arc;
 use ui::{
@@ -44,7 +46,7 @@ pub struct ReviewView {
     expanded_dirs: HashSet<SharedString>,
     display_entries: Vec<DisplayEntry>,
     expanded_comment_files: HashSet<SharedString>,
-    scroll_handle: UniformListScrollHandle,
+    list_state: ListState,
     // Cached per-data-change so `render` does no per-frame recompute.
     file_entries: Vec<(SharedString, Option<FileChangeStatus>, u32, u32)>,
     file_comments: HashMap<SharedString, Vec<ReviewComment>>,
@@ -69,12 +71,10 @@ enum RowKind {
         comments_expanded: bool,
     },
     Comment {
+        comment: ReviewComment,
+        body: Entity<Markdown>,
         path: SharedString,
         depth: usize,
-        is_reply: bool,
-        line: Option<u32>,
-        author: SharedString,
-        body_preview: SharedString,
     },
     GeneralHeader {
         count: usize,
@@ -124,7 +124,7 @@ impl ReviewView {
             expanded_dirs: HashSet::default(),
             display_entries: Vec::new(),
             expanded_comment_files: HashSet::default(),
-            scroll_handle: UniformListScrollHandle::new(),
+            list_state: ListState::new(0, ListAlignment::Top, px(1024.0)),
             file_entries: Vec::new(),
             file_comments: HashMap::default(),
             general_comments: Vec::new(),
@@ -139,7 +139,7 @@ impl ReviewView {
         self.tree_diff = tree_diff.map(|td| TreeDiff {
             entries: td.entries.clone(),
         });
-        self.rebuild();
+        self.rebuild(cx);
         cx.notify();
     }
 
@@ -152,7 +152,7 @@ impl ReviewView {
             ViewMode::Flat => ViewMode::Tree,
             ViewMode::Tree => ViewMode::Flat,
         };
-        self.rebuild();
+        self.rebuild(cx);
         cx.notify();
     }
 
@@ -162,20 +162,20 @@ impl ReviewView {
 
     fn begin_loading_comments(&mut self, cx: &mut Context<Self>) {
         self.pr_comments_loading = true;
-        self.rebuild();
+        self.rebuild(cx);
         cx.notify();
     }
 
     fn set_pr_comments(&mut self, comments: Vec<ReviewComment>, cx: &mut Context<Self>) {
         self.pr_comments = comments;
         self.pr_comments_loading = false;
-        self.rebuild();
+        self.rebuild(cx);
         cx.notify();
     }
 
     fn set_pr_api_files(&mut self, files: Vec<PullRequestFile>, cx: &mut Context<Self>) {
         self.pr_api_files = files;
-        self.rebuild();
+        self.rebuild(cx);
         cx.notify();
     }
 
@@ -183,7 +183,7 @@ impl ReviewView {
         if !self.expanded_dirs.remove(&path) {
             self.expanded_dirs.insert(path);
         }
-        self.rebuild();
+        self.rebuild(cx);
         cx.notify();
     }
 
@@ -191,14 +191,14 @@ impl ReviewView {
         if !self.expanded_comment_files.remove(&path) {
             self.expanded_comment_files.insert(path);
         }
-        self.rebuild();
+        self.rebuild(cx);
         cx.notify();
     }
 
     /// Recompute all cached state (file entries, grouped comments, display
     /// entries, and the flattened `visible_rows`). Private — reach it only via
     /// the mutator methods above so it can't be skipped.
-    fn rebuild(&mut self) {
+    fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.file_entries = self.compute_file_entries();
 
         let mut file_comments: HashMap<SharedString, Vec<ReviewComment>> = HashMap::default();
@@ -277,22 +277,14 @@ impl ReviewView {
                     if comments_expanded {
                         if let Some(comments) = comments {
                             for comment in comments {
-                                let body_preview: String = comment
-                                    .body
-                                    .chars()
-                                    .take(60)
-                                    .collect::<String>()
-                                    .lines()
-                                    .next()
-                                    .unwrap_or("")
-                                    .to_string();
+                                let body = cx.new(|cx| {
+                                    Markdown::new(comment.body.clone(), None, None, cx)
+                                });
                                 rows.push(RowKind::Comment {
+                                    comment: comment.clone(),
+                                    body,
                                     path: path.clone(),
                                     depth: *depth,
-                                    is_reply: comment.reply_to.is_some(),
-                                    line: comment.line,
-                                    author: comment.author.clone(),
-                                    body_preview: body_preview.into(),
                                 });
                             }
                         }
@@ -314,6 +306,7 @@ impl ReviewView {
             rows.push(RowKind::Loading);
         }
         self.visible_rows = rows;
+        self.list_state.reset(self.visible_rows.len());
     }
 
     fn compute_file_entries(&self) -> Vec<(SharedString, Option<FileChangeStatus>, u32, u32)> {
@@ -759,59 +752,26 @@ impl ReviewView {
                 file_row.into_any_element()
             }
             RowKind::Comment {
+                comment,
+                body,
                 path,
                 depth,
-                is_reply,
-                line,
-                author,
-                body_preview,
             } => {
                 let indent = *depth as f32 * TREE_INDENT + 8.0;
-                let is_reply = *is_reply;
-                let line_label = line.map(|l| format!("at {} ", l)).unwrap_or_default();
-                let author = author.clone();
-                let body_preview = body_preview.clone();
                 let repo_path = RepoPath::new(path.as_ref()).ok();
-
-                let row = h_flex()
-                    .id(SharedString::from(format!("compact_comment_{}", ix)))
-                    .px_2()
-                    .h(px(ROW_HEIGHT))
-                    .items_center()
-                    .gap_1()
-                    .pl(px(indent + 16.0))
-                    .when(is_reply, |el| el.pl(px(indent + 32.0)))
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                    .when(!line_label.is_empty(), |el| {
-                        el.child(
-                            Label::new(line_label)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Accent),
-                        )
-                    })
-                    .child(
-                        Label::new(format!("@{}", author))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Default),
-                    )
-                    .child(
-                        div().overflow_x_hidden().flex_1().child(
-                            Label::new(body_preview)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .single_line(),
-                        ),
-                    );
+                let card = div()
+                    .id(SharedString::from(format!("comment_{}", ix)))
+                    .pl(px(indent))
+                    .child(CommentCard::new(comment.clone(), body.clone()));
 
                 if let Some(repo_path) = repo_path {
-                    row.on_click(cx.listener(move |_this, _event, _window, cx| {
-                        cx.emit(ReviewViewEvent::OpenFileDiff(repo_path.clone()));
-                    }))
-                    .into_any_element()
+                    card.cursor_pointer()
+                        .on_click(cx.listener(move |_this, _event, _window, cx| {
+                            cx.emit(ReviewViewEvent::OpenFileDiff(repo_path.clone()));
+                        }))
+                        .into_any_element()
                 } else {
-                    row.into_any_element()
+                    card.into_any_element()
                 }
             }
             RowKind::GeneralHeader { count } => h_flex()
@@ -836,9 +796,9 @@ impl ReviewView {
                     .to_string();
                 h_flex()
                     .px_2()
-                    .h(px(ROW_HEIGHT))
-                    .items_center()
+                    .py_1()
                     .gap_1()
+                    .items_start()
                     .child(
                         Label::new(format!("@{}", comment.author))
                             .size(LabelSize::XSmall)
@@ -874,17 +834,13 @@ impl Render for ReviewView {
         let pr_title = self.selected_pr.title.clone();
         let pr_author = self.selected_pr.author.clone();
         let file_count = self.file_entries.len();
-        let row_count = self.visible_rows.len();
 
-        let scrollable = uniform_list(
-            "review-rows",
-            row_count,
-            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                range.map(|ix| this.render_row(ix, cx)).collect()
-            }),
-        )
-        .flex_1()
-        .track_scroll(&self.scroll_handle);
+        let weak = cx.weak_entity();
+        let scrollable = list(self.list_state.clone(), move |ix, _window, cx| {
+            weak.update(cx, |this, cx| this.render_row(ix, cx))
+                .unwrap_or_else(|_| gpui::Empty.into_any_element())
+        })
+        .flex_1();
 
         v_flex()
             .id("review-thread")
