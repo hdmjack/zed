@@ -179,6 +179,9 @@ impl ReviewPanel {
             injected_comment_blocks: HashMap::default(),
             _workspace_subscription: workspace_subscription,
         };
+        // Create the PR list up front so pull requests start loading in the
+        // background as soon as the provider resolves, before the view is opened.
+        this.ensure_pull_request_list(window, cx);
         this.initialize_provider(cx);
         this.load_branches(cx);
         this
@@ -667,25 +670,29 @@ impl ReviewPanel {
         cx.notify();
     }
 
-    fn show_pull_request_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pull_request_list.is_none() {
-            let pr_list = cx.new(|cx| {
-                PullRequestList::new(
-                    self.provider.clone(),
-                    self.remote_owner.clone(),
-                    self.remote_repo.clone(),
-                    window,
-                    cx,
-                )
-            });
-            let subscription =
-                cx.subscribe(&pr_list, |this, _pr_list, event, cx| match event {
-                    PullRequestListEvent::Selected(pr) => {
-                        this.select_pull_request(&pr.clone(), cx);
-                    }
-                });
-            self.pull_request_list = Some((pr_list, subscription));
+    fn ensure_pull_request_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pull_request_list.is_some() {
+            return;
         }
+        let pr_list = cx.new(|cx| {
+            PullRequestList::new(
+                self.provider.clone(),
+                self.remote_owner.clone(),
+                self.remote_repo.clone(),
+                window,
+                cx,
+            )
+        });
+        let subscription = cx.subscribe(&pr_list, |this, _pr_list, event, cx| match event {
+            PullRequestListEvent::Selected(pr) => {
+                this.select_pull_request(&pr.clone(), cx);
+            }
+        });
+        self.pull_request_list = Some((pr_list, subscription));
+    }
+
+    fn show_pull_request_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_pull_request_list(window, cx);
 
         if let Some((pr_list, _)) = &self.pull_request_list {
             pr_list.update(cx, |list, cx| list.load_if_empty(cx));
