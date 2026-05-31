@@ -893,12 +893,21 @@ impl ProjectDiff {
                 .map(|(buffer_snapshot, path_key)| (path_key.clone(), buffer_snapshot.remote_id()))
                 .collect::<HashMap<_, _>>();
 
+            // A PR review diff orders files purely by path so the editor matches
+            // the review sidebar (and GitHub); local diffs keep the status-based
+            // grouping (conflicts, then new, then tracked).
+            let order_by_path_only = this.branch_diff.read(cx).diff_base().has_explicit_head();
+
             if let Some(repo) = repo {
                 let repo = repo.read(cx);
 
                 path_keys = Vec::with_capacity(buffers_to_load.len());
                 for entry in buffers_to_load.iter() {
-                    let sort_prefix = sort_prefix(&repo, &entry.repo_path, entry.file_status, cx);
+                    let sort_prefix = if order_by_path_only {
+                        TRACKED_SORT_PREFIX
+                    } else {
+                        sort_prefix(&repo, &entry.repo_path, entry.file_status, cx)
+                    };
                     let path_key =
                         PathKey::with_sort_prefix(sort_prefix, entry.repo_path.as_ref().clone());
                     previous_buffers.remove(&path_key);
@@ -931,7 +940,13 @@ impl ProjectDiff {
 
         let mut buffers_to_fold = Vec::new();
 
-        for (entry, path_key) in buffers_to_load.into_iter().zip(path_keys) {
+        // Register buffers in sorted (final display) order so each excerpt is
+        // appended below the previous one as it loads, instead of being inserted
+        // above already-visible content and shifting the view.
+        let mut load_entries: Vec<_> = buffers_to_load.into_iter().zip(path_keys).collect();
+        load_entries.sort_by(|(_, a), (_, b)| a.cmp(b));
+
+        for (entry, path_key) in load_entries {
             if let Some((buffer, diff)) = entry.load.await.log_err() {
                 // We might be lagging behind enough that all future entry.load futures are no longer pending.
                 // If that is the case, this task will never yield, starving the foreground thread of execution time.
