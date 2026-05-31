@@ -419,12 +419,16 @@ impl ReviewPanel {
         let remote_url = repo.read(cx).default_remote_url();
         log::info!("review_panel: remote_url = {:?}", remote_url);
         let Some(remote_url) = remote_url else {
+            // The repository's remotes may not be populated yet right after it
+            // becomes active; keep the loader rather than flashing the empty
+            // state. A later repository event re-runs this once remotes load.
             log::info!("review_panel: no remote URL found");
-            self.set_remote_state(RemoteState::Unavailable, cx);
+            self.set_remote_state(RemoteState::Resolving, cx);
             return;
         };
 
         let Ok((owner, repo_name)) = parse_github_remote(&remote_url) else {
+            // We have a remote URL and it definitively isn't GitHub.
             log::info!("review_panel: failed to parse remote URL: {}", remote_url);
             self.set_remote_state(RemoteState::Unavailable, cx);
             return;
