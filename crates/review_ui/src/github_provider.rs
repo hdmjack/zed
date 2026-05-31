@@ -188,6 +188,92 @@ fn map_review_comment(comment: GhReviewComment) -> ReviewComment {
     }
 }
 
+// The PR list is fetched via GraphQL so we download only the handful of fields
+// the list renders, instead of REST's full PR objects (each of which embeds the
+// entire head/base repository objects, links, labels, and body).
+#[derive(Deserialize)]
+struct GraphQlResponse {
+    data: Option<PrQueryData>,
+    #[serde(default)]
+    errors: Vec<GraphQlError>,
+}
+
+#[derive(Deserialize)]
+struct GraphQlError {
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct PrQueryData {
+    repository: Option<RepositoryPrs>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RepositoryPrs {
+    pull_requests: PrConnection,
+}
+
+#[derive(Deserialize)]
+struct PrConnection {
+    nodes: Vec<GqlPullRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlPullRequest {
+    number: u32,
+    title: String,
+    state: String,
+    created_at: String,
+    updated_at: String,
+    base_ref_name: String,
+    head_ref_name: String,
+    base_ref_oid: String,
+    head_ref_oid: String,
+    author: Option<GqlAuthor>,
+    review_decision: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GqlAuthor {
+    login: String,
+}
+
+fn map_graphql_state(state: &str) -> PullRequestState {
+    match state {
+        "OPEN" => PullRequestState::Open,
+        "MERGED" => PullRequestState::Merged,
+        _ => PullRequestState::Closed,
+    }
+}
+
+fn map_review_decision(decision: Option<&str>) -> ReviewStatus {
+    match decision {
+        Some("APPROVED") => ReviewStatus::Approved,
+        Some("CHANGES_REQUESTED") => ReviewStatus::ChangesRequested,
+        _ => ReviewStatus::Pending,
+    }
+}
+
+fn map_graphql_pr(pr: GqlPullRequest) -> PullRequestInfo {
+    PullRequestInfo {
+        number: pr.number,
+        title: pr.title.into(),
+        author: pr.author.map(|a| a.login).unwrap_or_default().into(),
+        // The list doesn't render the body; fetch it lazily with PR details.
+        description: SharedString::default(),
+        state: map_graphql_state(&pr.state),
+        base_ref: pr.base_ref_name.into(),
+        head_ref: pr.head_ref_name.into(),
+        base_sha: pr.base_ref_oid.into(),
+        head_sha: pr.head_ref_oid.into(),
+        created_at: pr.created_at.into(),
+        updated_at: pr.updated_at.into(),
+        review_status: map_review_decision(pr.review_decision.as_deref()),
+    }
+}
+
 pub struct GitHubProvider {
     http_client: Arc<dyn HttpClient>,
     token: Option<String>,
@@ -210,19 +296,55 @@ impl ReviewProvider for GitHubProvider {
         repo: &str,
         state: PullRequestState,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<PullRequestInfo>>> + Send>> {
-        let state_param = match &state {
-            PullRequestState::Open => "open",
-            PullRequestState::Closed | PullRequestState::Merged => "closed",
-            PullRequestState::All => "all",
+        // A trailing comma is included so the clause drops cleanly into the
+        // argument list before `orderBy`; "All" omits the filter entirely.
+        let states_clause = match &state {
+            PullRequestState::Open => "states: [OPEN], ",
+            PullRequestState::Closed => "states: [CLOSED, MERGED], ",
+            PullRequestState::Merged => "states: [MERGED], ",
+            PullRequestState::All => "",
         };
-        let url =
-            format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls?state={state_param}&per_page=30");
+        let query = format!(
+            "query($owner: String!, $repo: String!, $first: Int!) {{ \
+               repository(owner: $owner, name: $repo) {{ \
+                 pullRequests(first: $first, {states_clause}orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ \
+                   nodes {{ \
+                     number title state createdAt updatedAt \
+                     baseRefName headRefName baseRefOid headRefOid \
+                     author {{ login }} reviewDecision \
+                   }} \
+                 }} \
+               }} \
+             }}"
+        );
+        let owner = owner.to_string();
+        let repo = repo.to_string();
+        let url = format!("{GITHUB_API_URL}/graphql");
         let http_client = self.http_client.clone();
         let token = self.token.clone();
 
         Box::pin(async move {
-            let gh_prs: Vec<GhPullRequest> = github_get(&http_client, &token, &url).await?;
-            Ok(gh_prs.into_iter().map(map_pull_request).collect())
+            let body = serde_json::json!({
+                "query": query,
+                "variables": { "owner": owner, "repo": repo, "first": 30 },
+            })
+            .to_string();
+            let response: GraphQlResponse = github_post(&http_client, &token, &url, body).await?;
+            if !response.errors.is_empty() {
+                let message = response
+                    .errors
+                    .into_iter()
+                    .map(|error| error.message)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                bail!("GitHub GraphQL error: {message}");
+            }
+            let nodes = response
+                .data
+                .and_then(|data| data.repository)
+                .map(|repository| repository.pull_requests.nodes)
+                .unwrap_or_default();
+            Ok(nodes.into_iter().map(map_graphql_pr).collect())
         })
     }
 
