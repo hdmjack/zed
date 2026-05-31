@@ -15,6 +15,18 @@ pub enum PullRequestListEvent {
     Selected(PullRequestInfo),
 }
 
+/// Tracks resolution of the GitHub provider so the list can distinguish
+/// "still figuring out the remote" from "this repo has no GitHub remote".
+#[derive(Clone, Copy, PartialEq)]
+pub enum RemoteState {
+    /// Provider resolution is in flight; show a loader.
+    Resolving,
+    /// No GitHub remote could be resolved; show the empty-state hint.
+    Unavailable,
+    /// Provider is ready; show the PR list.
+    Ready,
+}
+
 /// Fixed (two-line) row height so the PR list can be virtualized.
 const ROW_HEIGHT: f32 = 44.0;
 
@@ -22,6 +34,7 @@ pub struct PullRequestList {
     provider: Option<Arc<dyn ReviewProvider>>,
     remote_owner: Option<String>,
     remote_repo: Option<String>,
+    remote_state: RemoteState,
     pull_requests: Vec<PullRequestInfo>,
     /// `pull_requests` filtered by the current search query — cached so `render`
     /// does no per-frame filtering.
@@ -57,10 +70,17 @@ impl PullRequestList {
         })
         .detach();
 
+        let remote_state = if provider.is_some() {
+            RemoteState::Ready
+        } else {
+            RemoteState::Resolving
+        };
+
         Self {
             provider,
             remote_owner,
             remote_repo,
+            remote_state,
             pull_requests: Vec::new(),
             filtered: Vec::new(),
             loading: false,
@@ -99,7 +119,15 @@ impl PullRequestList {
         self.provider = Some(provider);
         self.remote_owner = Some(owner);
         self.remote_repo = Some(repo);
+        self.remote_state = RemoteState::Ready;
         self.load_pull_requests(cx);
+    }
+
+    pub fn set_remote_state(&mut self, state: RemoteState, cx: &mut Context<Self>) {
+        if self.remote_state != state {
+            self.remote_state = state;
+            cx.notify();
+        }
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -193,7 +221,23 @@ impl PullRequestList {
 
 impl Render for PullRequestList {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.provider.is_none() {
+        if self.remote_state == RemoteState::Resolving {
+            return v_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::ArrowCircle)
+                        .size(IconSize::Small)
+                        .color(Color::Muted)
+                        .with_rotate_animation(2),
+                )
+                .child(Label::new("Resolving GitHub repository…").color(Color::Muted))
+                .into_any_element();
+        }
+
+        if self.remote_state == RemoteState::Unavailable || self.provider.is_none() {
             return v_flex()
                 .size_full()
                 .justify_center()

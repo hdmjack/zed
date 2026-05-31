@@ -1,7 +1,7 @@
 use crate::file_list::{FileList, FileListEvent};
 use crate::github_provider::GitHubProvider;
 use crate::inline_comment::{ApplySuggestion, parse_suggestions, render_pr_comment_block, SuggestionBlock};
-use crate::pull_request_list::{PullRequestList, PullRequestListEvent};
+use crate::pull_request_list::{PullRequestList, PullRequestListEvent, RemoteState};
 use crate::review_view::{ReviewView, ReviewViewEvent};
 use crate::github_token::resolve_github_token;
 use crate::review_panel_settings::ReviewPanelSettings;
@@ -58,8 +58,6 @@ enum PendingAction {
     OpenDiff(RepoPath),
     OpenLocal(RepoPath),
     SelectPullRequest(PullRequestInfo),
-    /// Open the whole PR's combined diff (all files) in the editor.
-    OpenPrDiff,
 }
 
 pub struct ReviewPanel {
@@ -85,6 +83,8 @@ pub struct ReviewPanel {
     selected_pr: Option<PullRequestInfo>,
     pr_ref_fetch_task: Option<gpui::Task<Result<()>>>,
     pending_action: Option<PendingAction>,
+    /// Whether the PR's diff has been auto-opened for the current selection.
+    pr_diff_opened: bool,
     injected_comment_blocks: HashMap<EntityId, (WeakEntity<Editor>, Vec<CustomBlockId>)>,
     _workspace_subscription: Option<Subscription>,
 }
@@ -166,7 +166,7 @@ impl ReviewPanel {
             fs,
             recent_reviews_menu_handle: PopoverMenuHandle::default(),
             options_menu_handle: PopoverMenuHandle::default(),
-            active_view: ActiveView::Empty,
+            active_view: ActiveView::PullRequestList,
             recent_reviews: Vec::new(),
             http_client: workspace.client().http_client(),
             pull_request_list: None,
@@ -176,6 +176,7 @@ impl ReviewPanel {
             selected_pr: None,
             pr_ref_fetch_task: None,
             pending_action: None,
+            pr_diff_opened: false,
             injected_comment_blocks: HashMap::default(),
             _workspace_subscription: workspace_subscription,
         };
@@ -399,9 +400,19 @@ impl ReviewPanel {
             )
     }
 
+    fn set_remote_state(&mut self, state: RemoteState, cx: &mut Context<Self>) {
+        if let Some((pr_list, _)) = &self.pull_request_list {
+            pr_list.update(cx, |list, cx| list.set_remote_state(state, cx));
+        }
+    }
+
     fn initialize_provider(&mut self, cx: &mut Context<Self>) {
         let Some(repo) = self.active_repository.clone() else {
+            // The active repository hasn't been resolved yet (git is still
+            // loading); keep showing the loader rather than flashing the
+            // "no remote" empty state. A later repository event re-runs this.
             log::info!("review_panel: no active repository");
+            self.set_remote_state(RemoteState::Resolving, cx);
             return;
         };
 
@@ -409,11 +420,13 @@ impl ReviewPanel {
         log::info!("review_panel: remote_url = {:?}", remote_url);
         let Some(remote_url) = remote_url else {
             log::info!("review_panel: no remote URL found");
+            self.set_remote_state(RemoteState::Unavailable, cx);
             return;
         };
 
         let Ok((owner, repo_name)) = parse_github_remote(&remote_url) else {
             log::info!("review_panel: failed to parse remote URL: {}", remote_url);
+            self.set_remote_state(RemoteState::Unavailable, cx);
             return;
         };
         log::info!("review_panel: parsed {}/{}", owner, repo_name);
@@ -423,6 +436,7 @@ impl ReviewPanel {
 
         self.remote_owner = Some(owner);
         self.remote_repo = Some(repo_name);
+        self.set_remote_state(RemoteState::Resolving, cx);
 
         cx.spawn(async move |this, cx| {
             let token = resolve_github_token(credentials_provider, cx).await;
@@ -452,6 +466,7 @@ impl ReviewPanel {
         self.selected_pr = Some(pr.clone());
         self.base_branch = Some(pr.base_ref.clone());
         self.head_branch = Some(pr.head_ref.clone());
+        self.pr_diff_opened = false;
 
         self.fetch_pr_ref(pr.number, cx);
         self.pending_action = Some(PendingAction::SelectPullRequest(pr.clone()));
@@ -529,10 +544,6 @@ impl ReviewPanel {
 
             this.update(cx, |this, cx| {
                 this.load_diff(cx);
-                // Auto-open the PR's combined diff in the editor (flushed in
-                // render, where the Window is available).
-                this.pending_action = Some(PendingAction::OpenPrDiff);
-                cx.notify();
             })?;
             anyhow::Ok(())
         }));
@@ -562,8 +573,9 @@ impl ReviewPanel {
                     .map(|b| b.ref_name.clone());
                 if let Some(head) = head {
                     this.update(cx, |this, cx| {
+                        // Only record the branch names as fallback state; don't
+                        // auto-run the local branch diff (the panel is PR-focused).
                         this.head_branch = Some(head);
-                        this.load_diff(cx);
                         cx.notify();
                     })?;
                 }
@@ -639,8 +651,19 @@ impl ReviewPanel {
                     });
                 }
 
-                if !matches!(this.active_view, ActiveView::ReviewThread) && file_count > 0 {
-                    this.show_file_list(cx);
+                // Auto-open the PR's combined diff once, navigated to the first
+                // changed file. Opening via a concrete file (rather than the
+                // whole diff with no path) gives the editor a resolvable initial
+                // selection, avoiding a fold/selection panic.
+                if this.selected_pr.is_some() && !this.pr_diff_opened {
+                    if let Some(first_path) = this
+                        .tree_diff
+                        .as_ref()
+                        .and_then(|d| d.entries.keys().min().cloned())
+                    {
+                        this.pr_diff_opened = true;
+                        this.pending_action = Some(PendingAction::OpenDiff(first_path));
+                    }
                 }
             })?;
             anyhow::Ok(())
@@ -1035,21 +1058,6 @@ impl ReviewPanel {
                     window.dispatch_action(Box::new(git_ui::project_diff::BranchDiff), cx);
                 }
             }
-            PendingAction::OpenPrDiff => {
-                let Some(workspace) = self._workspace.upgrade() else {
-                    return;
-                };
-                let Some(pr) = self.selected_pr.as_ref() else {
-                    return;
-                };
-                let base_ref = pr.base_sha.clone();
-                let head_ref = Some(pr.head_sha.clone());
-                workspace.update(cx, |workspace, cx| {
-                    git_ui::project_diff::ProjectDiff::deploy_merge_diff(
-                        workspace, base_ref, head_ref, None, window, cx,
-                    );
-                });
-            }
             PendingAction::OpenLocal(path) => {
                 let Some(active_repo) = self.active_repository.as_ref() else {
                     return;
@@ -1070,9 +1078,9 @@ impl ReviewPanel {
             }
             PendingAction::SelectPullRequest(pr) => {
                 self.create_review_view(&pr, window, cx);
-                // Open the combined diff tab immediately. It starts empty and
-                // fills in once the PR ref finishes fetching (see fetch_pr_ref,
-                // which re-deploys to trigger a reload).
+                // Open the combined diff tab immediately (empty until the ref
+                // finishes fetching, after which load_diff's completion re-deploys
+                // to reload + navigate). Safe now that PR diffs don't auto-fold.
                 if let Some(workspace) = self._workspace.upgrade() {
                     let base_ref = pr.base_sha.clone();
                     let head_ref = Some(pr.head_sha.clone());
