@@ -14,7 +14,7 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    ButtonLike, ButtonSize, Color, ContextMenu, ElevationIndex, Icon, IconButton, IconName,
+    Button, ButtonLike, ButtonSize, Color, ContextMenu, ElevationIndex, Icon, IconButton, IconName,
     IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, SplitButton, Tooltip,
     div, h_flex, prelude::*, v_flex,
 };
@@ -40,6 +40,12 @@ pub struct ReviewView {
     tree_diff: Option<TreeDiff>,
     comment_editor: Entity<Editor>,
     comment_submitting: bool,
+    /// Editor for the inline reply composer; shown under the thread identified
+    /// by `replying_to`.
+    reply_editor: Entity<Editor>,
+    /// Root comment id whose thread currently has an open reply composer.
+    replying_to: Option<u64>,
+    reply_submitting: bool,
     review_action: ReviewStatus,
     review_action_menu_handle: PopoverMenuHandle<ContextMenu>,
     view_mode: ViewMode,
@@ -106,6 +112,16 @@ impl ReviewView {
             editor
         });
 
+        let reply_editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(2, 6, window, cx);
+            editor.set_placeholder_text("Reply…", window, cx);
+            editor.set_show_gutter(false, cx);
+            editor.set_show_wrap_guides(false, cx);
+            editor.set_show_indent_guides(false, cx);
+            editor.set_use_autoclose(false);
+            editor
+        });
+
         let pr_number = pull_request.number;
         let mut this = Self {
             provider,
@@ -118,6 +134,9 @@ impl ReviewView {
             tree_diff: None,
             comment_editor,
             comment_submitting: false,
+            reply_editor,
+            replying_to: None,
+            reply_submitting: false,
             review_action: ReviewStatus::Commented,
             review_action_menu_handle: PopoverMenuHandle::default(),
             view_mode: ViewMode::Flat,
@@ -486,6 +505,92 @@ impl ReviewView {
         }
     }
 
+    fn submit_reply(&mut self, parent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(provider) = self.provider.clone() else {
+            return;
+        };
+        let Some(owner) = self.remote_owner.clone() else {
+            return;
+        };
+        let Some(repo) = self.remote_repo.clone() else {
+            return;
+        };
+
+        let body = self.reply_editor.read(cx).text(cx);
+        if body.trim().is_empty() {
+            return;
+        }
+        let pr_number = self.selected_pr.number;
+        self.reply_submitting = true;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let new_comment = provider
+                .reply_to_comment(&owner, &repo, pr_number, &body, parent_id)
+                .await?;
+            this.update_in(cx, |this, window, cx| {
+                this.pr_comments.push(new_comment);
+                this.reply_submitting = false;
+                this.replying_to = None;
+                this.reply_editor.update(cx, |editor, cx| {
+                    editor.clear(window, cx);
+                });
+                this.rebuild(cx);
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn render_reply_composer(&self, parent_id: u64, cx: &mut Context<Self>) -> impl IntoElement {
+        let submitting = self.reply_submitting;
+        v_flex()
+            .mt_1()
+            .gap_1()
+            .child(
+                div()
+                    .id("reply-editor-container")
+                    .px_2()
+                    .pt_1()
+                    .w_full()
+                    .cursor_text()
+                    .border_1()
+                    .border_color(cx.theme().colors().border)
+                    .rounded_md()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        window.focus(&this.reply_editor.focus_handle(cx), cx);
+                    }))
+                    .child(self.reply_editor.clone()),
+            )
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_1()
+                    .child(
+                        Button::new("reply-cancel", "Cancel")
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.replying_to = None;
+                                this.reply_editor.update(cx, |editor, cx| {
+                                    editor.clear(window, cx);
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("reply-submit", "Reply")
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .disabled(submitting)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.submit_reply(parent_id, window, cx);
+                            })),
+                    ),
+            )
+    }
+
     fn review_action_label(&self) -> &'static str {
         match &self.review_action {
             ReviewStatus::Commented => "Comment",
@@ -759,20 +864,45 @@ impl ReviewView {
             } => {
                 let indent = *depth as f32 * TREE_INDENT + 8.0;
                 let repo_path = RepoPath::new(path.as_ref()).ok();
-                let card = div()
-                    .id(SharedString::from(format!("comment_{}", ix)))
-                    .pl(px(indent))
-                    .child(CommentCard::new(comment.clone(), body.clone()));
+                let comment_id = comment.id;
+                // Only root comments anchor a reply composer; replies thread
+                // under the same root on GitHub.
+                let is_root = comment.reply_to.is_none();
+                let is_replying = self.replying_to == Some(comment_id);
 
+                let mut card = div()
+                    .id(SharedString::from(format!("comment_{}", ix)))
+                    .child(CommentCard::new(comment.clone(), body.clone()));
                 if let Some(repo_path) = repo_path {
-                    card.cursor_pointer()
-                        .on_click(cx.listener(move |_this, _event, _window, cx| {
+                    card = card.cursor_pointer().on_click(cx.listener(
+                        move |_this, _event, _window, cx| {
                             cx.emit(ReviewViewEvent::OpenFileDiff(repo_path.clone()));
-                        }))
-                        .into_any_element()
-                } else {
-                    card.into_any_element()
+                        },
+                    ));
                 }
+
+                let mut container = v_flex().pl(px(indent)).gap_1().child(card);
+                if is_root && !is_replying {
+                    container = container.child(
+                        h_flex().child(
+                            Button::new(
+                                SharedString::from(format!("reply-{comment_id}")),
+                                "Reply",
+                            )
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.replying_to = Some(comment_id);
+                                window.focus(&this.reply_editor.focus_handle(cx), cx);
+                                cx.notify();
+                            })),
+                        ),
+                    );
+                }
+                if is_replying {
+                    container = container.child(self.render_reply_composer(comment_id, cx));
+                }
+                container.into_any_element()
             }
             RowKind::GeneralHeader { count } => h_flex()
                 .px_2()

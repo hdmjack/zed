@@ -494,6 +494,63 @@ impl ReviewProvider for GitHubProvider {
         })
     }
 
+    fn reply_to_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u32,
+        body: &str,
+        in_reply_to_id: u64,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ReviewComment>> + Send>> {
+        let url = format!(
+            "{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/comments/{in_reply_to_id}/replies"
+        );
+        let json = serde_json::json!({ "body": body }).to_string();
+        let http_client = self.http_client.clone();
+        let token = self.token.clone();
+
+        Box::pin(async move {
+            let gh_comment: GhReviewComment =
+                github_post(&http_client, &token, &url, json).await?;
+            Ok(map_review_comment(gh_comment))
+        })
+    }
+
+    fn submit_inline_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u32,
+        body: &str,
+        commit_id: &str,
+        path: &str,
+        start_line: Option<u32>,
+        line: u32,
+        side: &str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ReviewComment>> + Send>> {
+        let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/comments");
+        let mut payload = serde_json::json!({
+            "body": body,
+            "commit_id": commit_id,
+            "path": path,
+            "line": line,
+            "side": side,
+        });
+        if let Some(start_line) = start_line {
+            payload["start_line"] = serde_json::json!(start_line);
+            payload["start_side"] = serde_json::json!(side);
+        }
+        let json = payload.to_string();
+        let http_client = self.http_client.clone();
+        let token = self.token.clone();
+
+        Box::pin(async move {
+            let gh_comment: GhReviewComment =
+                github_post(&http_client, &token, &url, json).await?;
+            Ok(map_review_comment(gh_comment))
+        })
+    }
+
     fn submit_review(
         &self,
         owner: &str,

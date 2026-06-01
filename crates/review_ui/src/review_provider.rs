@@ -150,6 +150,33 @@ pub trait ReviewProvider: Send + Sync {
         line: Option<u32>,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<ReviewComment>> + Send>>;
 
+    /// Reply to an existing review comment thread. `in_reply_to_id` is the id of
+    /// the comment being replied to.
+    fn reply_to_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u32,
+        body: &str,
+        in_reply_to_id: u64,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ReviewComment>> + Send>>;
+
+    /// Post a new inline review comment on a diff line (or line range, when
+    /// `start_line` is set). `commit_id` is the SHA the comment is anchored to,
+    /// and `side` is "RIGHT" (head) or "LEFT" (base).
+    fn submit_inline_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u32,
+        body: &str,
+        commit_id: &str,
+        path: &str,
+        start_line: Option<u32>,
+        line: u32,
+        side: &str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ReviewComment>> + Send>>;
+
     fn submit_review(
         &self,
         owner: &str,
