@@ -17,6 +17,8 @@ struct GhPullRequest {
     user: GhUser,
     body: Option<String>,
     state: String,
+    #[serde(default)]
+    draft: bool,
     base: GhRef,
     head: GhRef,
     created_at: String,
@@ -163,6 +165,7 @@ fn map_pull_request(pr: GhPullRequest) -> PullRequestInfo {
         created_at: pr.created_at.into(),
         updated_at: pr.updated_at.into(),
         review_status: ReviewStatus::Pending,
+        is_draft: pr.draft,
     }
 }
 
@@ -215,8 +218,18 @@ struct RepositoryPrs {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PrConnection {
+    total_count: usize,
+    page_info: GqlPageInfo,
     nodes: Vec<GqlPullRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -233,6 +246,7 @@ struct GqlPullRequest {
     head_ref_oid: String,
     author: Option<GqlAuthor>,
     review_decision: Option<String>,
+    is_draft: bool,
 }
 
 #[derive(Deserialize)]
@@ -271,6 +285,7 @@ fn map_graphql_pr(pr: GqlPullRequest) -> PullRequestInfo {
         created_at: pr.created_at.into(),
         updated_at: pr.updated_at.into(),
         review_status: map_review_decision(pr.review_decision.as_deref()),
+        is_draft: pr.is_draft,
     }
 }
 
@@ -295,7 +310,8 @@ impl ReviewProvider for GitHubProvider {
         owner: &str,
         repo: &str,
         state: PullRequestState,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<PullRequestInfo>>> + Send>> {
+        after: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PullRequestPage>> + Send>> {
         // A trailing comma is included so the clause drops cleanly into the
         // argument list before `orderBy`; "All" omits the filter entirely.
         let states_clause = match &state {
@@ -305,11 +321,13 @@ impl ReviewProvider for GitHubProvider {
             PullRequestState::All => "",
         };
         let query = format!(
-            "query($owner: String!, $repo: String!, $first: Int!) {{ \
+            "query($owner: String!, $repo: String!, $first: Int!, $after: String) {{ \
                repository(owner: $owner, name: $repo) {{ \
-                 pullRequests(first: $first, {states_clause}orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ \
+                 pullRequests(first: $first, after: $after, {states_clause}orderBy: {{field: UPDATED_AT, direction: DESC}}) {{ \
+                   totalCount \
+                   pageInfo {{ hasNextPage endCursor }} \
                    nodes {{ \
-                     number title state createdAt updatedAt \
+                     number title state createdAt updatedAt isDraft \
                      baseRefName headRefName baseRefOid headRefOid \
                      author {{ login }} reviewDecision \
                    }} \
@@ -326,7 +344,7 @@ impl ReviewProvider for GitHubProvider {
         Box::pin(async move {
             let body = serde_json::json!({
                 "query": query,
-                "variables": { "owner": owner, "repo": repo, "first": 30 },
+                "variables": { "owner": owner, "repo": repo, "first": 30, "after": after },
             })
             .to_string();
             let response: GraphQlResponse = github_post(&http_client, &token, &url, body).await?;
@@ -339,12 +357,19 @@ impl ReviewProvider for GitHubProvider {
                     .join("; ");
                 bail!("GitHub GraphQL error: {message}");
             }
-            let nodes = response
+            let connection = response
                 .data
                 .and_then(|data| data.repository)
-                .map(|repository| repository.pull_requests.nodes)
-                .unwrap_or_default();
-            Ok(nodes.into_iter().map(map_graphql_pr).collect())
+                .map(|repository| repository.pull_requests);
+            let Some(connection) = connection else {
+                return Ok(PullRequestPage::default());
+            };
+            Ok(PullRequestPage {
+                pull_requests: connection.nodes.into_iter().map(map_graphql_pr).collect(),
+                total_count: connection.total_count,
+                end_cursor: connection.page_info.end_cursor,
+                has_next_page: connection.page_info.has_next_page,
+            })
         })
     }
 

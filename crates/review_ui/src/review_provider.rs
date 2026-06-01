@@ -26,6 +26,16 @@ pub enum FileChangeStatus {
     Renamed { from: SharedString },
 }
 
+/// One page of pull requests plus the cursor needed to fetch the next page and
+/// the repository-wide total for the current filter.
+#[derive(Clone, Debug, Default)]
+pub struct PullRequestPage {
+    pub pull_requests: Vec<PullRequestInfo>,
+    pub total_count: usize,
+    pub end_cursor: Option<String>,
+    pub has_next_page: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct PullRequestFile {
     pub path: SharedString,
@@ -94,16 +104,20 @@ pub struct PullRequestInfo {
     pub created_at: SharedString,
     pub updated_at: SharedString,
     pub review_status: ReviewStatus,
+    pub is_draft: bool,
 }
 
 pub trait ReviewProvider: Send + Sync {
     fn name(&self) -> &'static str;
+    /// Fetch one page of pull requests. `after` is the opaque cursor returned by
+    /// a previous page (None for the first page).
     fn fetch_pull_requests(
         &self,
         owner: &str,
         repo: &str,
         state: PullRequestState,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<PullRequestInfo>>> + Send>>;
+        after: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PullRequestPage>> + Send>>;
 
     fn fetch_pull_request_details(
         &self,

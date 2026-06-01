@@ -40,6 +40,17 @@ pub struct PullRequestList {
     /// does no per-frame filtering.
     filtered: Vec<PullRequestInfo>,
     loading: bool,
+    /// True while a follow-up page is being fetched (infinite scroll).
+    loading_more: bool,
+    /// Cursor for the next page; None once the last page has loaded.
+    end_cursor: Option<String>,
+    has_next_page: bool,
+    /// Repository-wide count for the current filter, shown in the header
+    /// regardless of how many pages have been loaded so far.
+    total_count: usize,
+    /// When false, draft PRs are hidden from the rendered list (client-side;
+    /// the GraphQL connection has no draft argument).
+    show_drafts: bool,
     filter: PullRequestState,
     filter_menu_handle: PopoverMenuHandle<ContextMenu>,
     search_editor: Entity<Editor>,
@@ -84,6 +95,11 @@ impl PullRequestList {
             pull_requests: Vec::new(),
             filtered: Vec::new(),
             loading: false,
+            loading_more: false,
+            end_cursor: None,
+            has_next_page: false,
+            total_count: 0,
+            show_drafts: false,
             filter: PullRequestState::Open,
             filter_menu_handle: PopoverMenuHandle::default(),
             search_editor,
@@ -97,6 +113,9 @@ impl PullRequestList {
             .pull_requests
             .iter()
             .filter(|pr| {
+                if !self.show_drafts && pr.is_draft {
+                    return false;
+                }
                 if query.is_empty() {
                     return true;
                 }
@@ -153,19 +172,75 @@ impl PullRequestList {
 
         let state = self.filter.clone();
         self.loading = true;
+        self.loading_more = false;
+        self.end_cursor = None;
+        self.has_next_page = false;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let pull_requests = provider.fetch_pull_requests(&owner, &repo, state).await?;
+            let page = provider
+                .fetch_pull_requests(&owner, &repo, state, None)
+                .await?;
             this.update(cx, |this, cx| {
-                this.pull_requests = pull_requests;
+                this.pull_requests = page.pull_requests;
+                this.total_count = page.total_count;
+                this.end_cursor = page.end_cursor;
+                this.has_next_page = page.has_next_page;
                 this.loading = false;
                 this.recompute_filtered(cx);
+                this.maybe_load_more_for_fill(cx);
                 cx.notify();
             })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    /// Fetch the next page and append it. No-op while a load is already in
+    /// flight or there are no more pages.
+    fn load_more_pull_requests(&mut self, cx: &mut Context<Self>) {
+        if self.loading || self.loading_more || !self.has_next_page {
+            return;
+        }
+        let (Some(provider), Some(owner), Some(repo)) = (
+            self.provider.clone(),
+            self.remote_owner.clone(),
+            self.remote_repo.clone(),
+        ) else {
+            return;
+        };
+
+        let state = self.filter.clone();
+        let after = self.end_cursor.clone();
+        self.loading_more = true;
+
+        cx.spawn(async move |this, cx| {
+            let page = provider
+                .fetch_pull_requests(&owner, &repo, state, after)
+                .await?;
+            this.update(cx, |this, cx| {
+                this.pull_requests.extend(page.pull_requests);
+                this.total_count = page.total_count;
+                this.end_cursor = page.end_cursor;
+                this.has_next_page = page.has_next_page;
+                this.loading_more = false;
+                this.recompute_filtered(cx);
+                this.maybe_load_more_for_fill(cx);
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// When a client-side filter (drafts hidden, search) leaves too few visible
+    /// rows to scroll, the infinite-scroll trigger can't fire, so eagerly pull
+    /// more pages until the viewport can fill or the list is exhausted.
+    fn maybe_load_more_for_fill(&mut self, cx: &mut Context<Self>) {
+        const MIN_VISIBLE_ROWS: usize = 20;
+        if self.has_next_page && !self.loading_more && self.filtered.len() < MIN_VISIBLE_ROWS {
+            self.load_more_pull_requests(cx);
+        }
     }
 
     fn set_filter(&mut self, state: PullRequestState, cx: &mut Context<Self>) {
@@ -183,6 +258,7 @@ impl PullRequestList {
         let title = pr.title.clone();
         let author = pr.author.clone();
         let updated = pr.updated_at.clone();
+        let is_draft = pr.is_draft;
         h_flex()
             .id(SharedString::from(format!("pr_{}", number)))
             .px_2()
@@ -201,9 +277,31 @@ impl PullRequestList {
                 v_flex()
                     .overflow_x_hidden()
                     .child(
-                        Label::new(title.to_string())
-                            .size(LabelSize::Small)
-                            .single_line(),
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .overflow_x_hidden()
+                            .when(is_draft, |line| {
+                                line.child(
+                                    div()
+                                        .flex_none()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(cx.theme().colors().border)
+                                        .bg(cx.theme().colors().element_background)
+                                        .child(
+                                            Label::new("Draft")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Accent),
+                                        ),
+                                )
+                            })
+                            .child(
+                                Label::new(title.to_string())
+                                    .size(LabelSize::Small)
+                                    .single_line(),
+                            ),
                     )
                     .child(
                         Label::new(format!("by {} · {}", author, updated))
@@ -297,6 +395,22 @@ impl Render for PullRequestList {
                     .items_center()
                     .child(div().flex_1().child(self.search_editor.clone()))
                     .child(
+                        IconButton::new("pr-draft-toggle", IconName::Notepad)
+                        .icon_size(IconSize::Small)
+                        .toggle_state(self.show_drafts)
+                        .tooltip(Tooltip::text(if self.show_drafts {
+                            "Hide drafts"
+                        } else {
+                            "Show drafts"
+                        }))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.show_drafts = !this.show_drafts;
+                            this.recompute_filtered(cx);
+                            this.maybe_load_more_for_fill(cx);
+                            cx.notify();
+                        })),
+                    )
+                    .child(
                         PopoverMenu::new("pr-filter-menu")
                             .trigger(
                                 IconButton::new("pr-filter-trigger", IconName::Filter)
@@ -358,9 +472,12 @@ impl Render for PullRequestList {
             )
             .child(
                 h_flex().px_2().pb_1().child(
-                    Label::new(format!("{} {} pull requests", filtered_count, filter_label))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                    Label::new(format!(
+                        "{} {} pull requests",
+                        self.total_count, filter_label
+                    ))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
                 ),
             )
             .child(
@@ -368,6 +485,13 @@ impl Render for PullRequestList {
                     "pr-list-rows",
                     filtered_count,
                     cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                        // Prefetch the next page as the user scrolls near the end.
+                        if this.has_next_page
+                            && !this.loading_more
+                            && range.end + 10 >= this.filtered.len()
+                        {
+                            this.load_more_pull_requests(cx);
+                        }
                         range.map(|ix| this.render_row(ix, cx)).collect()
                     }),
                 )
