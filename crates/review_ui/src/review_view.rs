@@ -84,7 +84,9 @@ enum RowKind {
     },
     Comment {
         comment: ReviewComment,
-        body: Entity<Markdown>,
+        /// Full-body markdown, built only when the thread is expanded to avoid
+        /// holding parsed markdown for every (collapsed) comment.
+        body: Option<Entity<Markdown>>,
         /// Markdown for the one-line collapsed preview.
         preview: Entity<Markdown>,
         path: SharedString,
@@ -102,7 +104,7 @@ enum RowKind {
     },
     GeneralComment {
         comment: ReviewComment,
-        body: Entity<Markdown>,
+        body: Option<Entity<Markdown>>,
         preview: Entity<Markdown>,
         expanded: bool,
     },
@@ -350,7 +352,8 @@ impl ReviewView {
                 // opening the root opens the whole thread.
                 let thread_id = comment.reply_to.unwrap_or(comment.id);
                 let expanded = self.expanded_comments.contains(&thread_id);
-                let body = crate::inline_comment::comment_markdown(comment.body.clone(), cx);
+                let body = expanded
+                    .then(|| crate::inline_comment::comment_markdown(comment.body.clone(), cx));
                 let preview = crate::inline_comment::comment_markdown(
                     preview_source(&comment.body).into(),
                     cx,
@@ -371,7 +374,8 @@ impl ReviewView {
             });
             for comment in &self.general_comments {
                 let expanded = self.expanded_comments.contains(&comment.id);
-                let body = crate::inline_comment::comment_markdown(comment.body.clone(), cx);
+                let body = expanded
+                    .then(|| crate::inline_comment::comment_markdown(comment.body.clone(), cx));
                 let preview = crate::inline_comment::comment_markdown(
                     preview_source(&comment.body).into(),
                     cx,
@@ -984,7 +988,7 @@ impl ReviewView {
                                 this.toggle_comment(thread_id, cx);
                             })),
                     )
-                    .child(CommentCard::new(comment.clone(), body.clone()));
+                    .child(CommentCard::new(comment.clone(), body.clone().unwrap_or_else(|| preview.clone())));
                 if is_root && !is_replying {
                     container = container.child(
                         h_flex().pl_2().child(
@@ -1091,7 +1095,7 @@ impl ReviewView {
                                     this.toggle_comment(comment_id, cx);
                                 })),
                         )
-                        .child(CommentCard::new(comment.clone(), body.clone()))
+                        .child(CommentCard::new(comment.clone(), body.clone().unwrap_or_else(|| preview.clone())))
                         .into_any_element()
                 } else {
                     h_flex()
