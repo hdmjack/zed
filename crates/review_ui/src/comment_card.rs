@@ -16,6 +16,35 @@ impl CommentCard {
     }
 }
 
+/// A one-line, formatted preview of a comment body (markdown rendered, clipped
+/// to a single line) for collapsed rows.
+#[derive(IntoElement)]
+pub struct CommentPreview {
+    body: Entity<Markdown>,
+}
+
+impl CommentPreview {
+    pub fn new(body: Entity<Markdown>) -> Self {
+        Self { body }
+    }
+}
+
+impl RenderOnce for CommentPreview {
+    fn render(self, window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
+        let mut style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
+        style.base_text_style.color = cx.theme().colors().text_muted;
+        // Skip the paragraph's bottom margin / tall line-height so the single
+        // line sits flush in the clipped row.
+        style.height_is_multiple_of_line_height = true;
+        div()
+            .h(px(18.0))
+            .min_w_0()
+            .overflow_hidden()
+            .text_size(px(12.0))
+            .child(MarkdownElement::new(self.body, style))
+    }
+}
+
 impl RenderOnce for CommentCard {
     fn render(self, window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
         let is_reply = self.comment.reply_to.is_some();

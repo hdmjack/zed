@@ -1,4 +1,4 @@
-use crate::comment_card::CommentCard;
+use crate::comment_card::{CommentCard, CommentPreview};
 use crate::file_list::{DisplayEntry, ViewMode, build_file_tree, flatten_file_tree};
 use crate::review_provider::{
     FileChangeStatus, PullRequestFile, PullRequestInfo, ReviewComment, ReviewProvider, ReviewStatus,
@@ -51,19 +51,23 @@ pub struct ReviewView {
     view_mode: ViewMode,
     expanded_dirs: HashSet<SharedString>,
     display_entries: Vec<DisplayEntry>,
-    expanded_comment_files: HashSet<SharedString>,
     /// General (conversation) comment ids that are expanded to their full body;
     /// collapsed comments show only a first-line preview.
-    expanded_general_comments: HashSet<u64>,
-    list_state: ListState,
+    expanded_comments: HashSet<u64>,
+    // Files panel (top) and comments panel (bottom) are separate virtualized
+    // lists with their own scroll state.
+    file_list_state: ListState,
+    comment_list_state: ListState,
     // Cached per-data-change so `render` does no per-frame recompute.
     file_entries: Vec<(SharedString, Option<FileChangeStatus>, u32, u32)>,
     file_comments: HashMap<SharedString, Vec<ReviewComment>>,
     general_comments: Vec<ReviewComment>,
-    visible_rows: Vec<RowKind>,
+    file_rows: Vec<RowKind>,
+    comment_rows: Vec<RowKind>,
 }
 
 /// One flattened, virtualizable row in the review scroll area.
+#[derive(Clone)]
 enum RowKind {
     Directory {
         path: SharedString,
@@ -77,13 +81,21 @@ enum RowKind {
         display_name: SharedString,
         path: SharedString,
         comment_count: usize,
-        comments_expanded: bool,
     },
     Comment {
         comment: ReviewComment,
         body: Entity<Markdown>,
+        /// Markdown for the one-line collapsed preview.
+        preview: Entity<Markdown>,
         path: SharedString,
         depth: usize,
+        expanded: bool,
+    },
+    /// Header above a file's comment threads in the comments panel.
+    CommentFileHeader {
+        display_name: SharedString,
+        path: SharedString,
+        count: usize,
     },
     GeneralHeader {
         count: usize,
@@ -91,12 +103,27 @@ enum RowKind {
     GeneralComment {
         comment: ReviewComment,
         body: Entity<Markdown>,
+        preview: Entity<Markdown>,
         expanded: bool,
     },
     Loading,
 }
 
 impl EventEmitter<ReviewViewEvent> for ReviewView {}
+
+/// Markdown source for a collapsed comment's one-line preview: the first
+/// non-empty line with leading block markers (heading/quote/list) stripped so
+/// it renders as a plain paragraph, but inline emphasis/code kept so the
+/// preview is styled rather than literal.
+fn preview_source(body: &str) -> String {
+    body.lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim_start_matches(['#', '>', '-', '*', ' '])
+        .chars()
+        .take(160)
+        .collect()
+}
 
 impl ReviewView {
     pub fn new(
@@ -147,13 +174,14 @@ impl ReviewView {
             view_mode: ViewMode::Flat,
             expanded_dirs: HashSet::default(),
             display_entries: Vec::new(),
-            expanded_comment_files: HashSet::default(),
-            expanded_general_comments: HashSet::default(),
-            list_state: ListState::new(0, ListAlignment::Top, px(1024.0)),
+            expanded_comments: HashSet::default(),
+            file_list_state: ListState::new(0, ListAlignment::Top, px(1024.0)),
+            comment_list_state: ListState::new(0, ListAlignment::Top, px(1024.0)),
             file_entries: Vec::new(),
             file_comments: HashMap::default(),
             general_comments: Vec::new(),
-            visible_rows: Vec::new(),
+            file_rows: Vec::new(),
+            comment_rows: Vec::new(),
         };
         this.load_pr_comments(pr_number, cx);
         this.load_pr_api_files(pr_number, cx);
@@ -212,17 +240,9 @@ impl ReviewView {
         cx.notify();
     }
 
-    fn toggle_comment_file(&mut self, path: SharedString, cx: &mut Context<Self>) {
-        if !self.expanded_comment_files.remove(&path) {
-            self.expanded_comment_files.insert(path);
-        }
-        self.rebuild(cx);
-        cx.notify();
-    }
-
-    fn toggle_general_comment(&mut self, comment_id: u64, cx: &mut Context<Self>) {
-        if !self.expanded_general_comments.remove(&comment_id) {
-            self.expanded_general_comments.insert(comment_id);
+    fn toggle_comment(&mut self, comment_id: u64, cx: &mut Context<Self>) {
+        if !self.expanded_comments.remove(&comment_id) {
+            self.expanded_comments.insert(comment_id);
         }
         self.rebuild(cx);
         cx.notify();
@@ -273,7 +293,8 @@ impl ReviewView {
         }
         self.display_entries = display_entries;
 
-        let mut rows = Vec::new();
+        // Top panel: pure file/dir navigation tree (no inline comments).
+        let mut file_rows = Vec::new();
         for entry in &self.display_entries {
             match entry {
                 DisplayEntry::Directory {
@@ -281,7 +302,7 @@ impl ReviewView {
                     name,
                     depth,
                     expanded,
-                } => rows.push(RowKind::Directory {
+                } => file_rows.push(RowKind::Directory {
                     path: path.clone(),
                     name: name.clone(),
                     depth: *depth,
@@ -296,54 +317,80 @@ impl ReviewView {
                         continue;
                     };
                     let path = path.clone();
-                    let comments = self.file_comments.get(&path);
-                    let comment_count = comments.map(|c| c.len()).unwrap_or(0);
-                    let comments_expanded = self.expanded_comment_files.contains(&path);
-                    rows.push(RowKind::File {
+                    let comment_count = self.file_comments.get(&path).map_or(0, |c| c.len());
+                    file_rows.push(RowKind::File {
                         entry_index: *entry_index,
                         depth: *depth,
                         display_name: display_name.clone(),
-                        path: path.clone(),
+                        path,
                         comment_count,
-                        comments_expanded,
                     });
-                    if comments_expanded {
-                        if let Some(comments) = comments {
-                            for comment in comments {
-                                let body =
-                                    crate::inline_comment::comment_markdown(comment.body.clone(), cx);
-                                rows.push(RowKind::Comment {
-                                    comment: comment.clone(),
-                                    body,
-                                    path: path.clone(),
-                                    depth: *depth,
-                                });
-                            }
-                        }
-                    }
                 }
             }
         }
+        self.file_rows = file_rows;
+
+        // Bottom panel: all comment threads, grouped by file (in tree order),
+        // followed by the general conversation comments.
+        let mut comment_rows = Vec::new();
+        for (path, _, _, _) in &self.file_entries {
+            let Some(comments) = self.file_comments.get(path) else {
+                continue;
+            };
+            if comments.is_empty() {
+                continue;
+            }
+            comment_rows.push(RowKind::CommentFileHeader {
+                display_name: path.clone(),
+                path: path.clone(),
+                count: comments.len(),
+            });
+            for comment in comments {
+                // Expansion is per-thread: a reply follows its root's state, so
+                // opening the root opens the whole thread.
+                let thread_id = comment.reply_to.unwrap_or(comment.id);
+                let expanded = self.expanded_comments.contains(&thread_id);
+                let body = crate::inline_comment::comment_markdown(comment.body.clone(), cx);
+                let preview = crate::inline_comment::comment_markdown(
+                    preview_source(&comment.body).into(),
+                    cx,
+                );
+                comment_rows.push(RowKind::Comment {
+                    comment: comment.clone(),
+                    body,
+                    preview,
+                    path: path.clone(),
+                    depth: 0,
+                    expanded,
+                });
+            }
+        }
         if !self.general_comments.is_empty() {
-            rows.push(RowKind::GeneralHeader {
+            comment_rows.push(RowKind::GeneralHeader {
                 count: self.general_comments.len(),
             });
             for comment in &self.general_comments {
-                let expanded = self.expanded_general_comments.contains(&comment.id);
-                let body =
-                    crate::inline_comment::comment_markdown(comment.body.clone(), cx);
-                rows.push(RowKind::GeneralComment {
+                let expanded = self.expanded_comments.contains(&comment.id);
+                let body = crate::inline_comment::comment_markdown(comment.body.clone(), cx);
+                let preview = crate::inline_comment::comment_markdown(
+                    preview_source(&comment.body).into(),
+                    cx,
+                );
+                comment_rows.push(RowKind::GeneralComment {
                     comment: comment.clone(),
                     body,
+                    preview,
                     expanded,
                 });
             }
         }
         if self.pr_comments_loading {
-            rows.push(RowKind::Loading);
+            comment_rows.push(RowKind::Loading);
         }
-        self.visible_rows = rows;
-        self.list_state.reset(self.visible_rows.len());
+        self.comment_rows = comment_rows;
+
+        self.file_list_state.reset(self.file_rows.len());
+        self.comment_list_state.reset(self.comment_rows.len());
     }
 
     fn compute_file_entries(&self) -> Vec<(SharedString, Option<FileChangeStatus>, u32, u32)> {
@@ -731,8 +778,8 @@ impl ReviewView {
 
 impl ReviewView {
     /// Render a single cached row. Pure read of cached state — no recompute.
-    fn render_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-        match &self.visible_rows[ix] {
+    fn render_row(&mut self, row: RowKind, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        match &row {
             RowKind::Directory {
                 path,
                 name,
@@ -779,7 +826,6 @@ impl ReviewView {
                 display_name,
                 path,
                 comment_count,
-                comments_expanded,
             } => {
                 let (status, additions, deletions) = match self.file_entries.get(*entry_index) {
                     Some((_, status, additions, deletions)) => {
@@ -797,8 +843,6 @@ impl ReviewView {
                 let indent = *depth as f32 * TREE_INDENT + 8.0;
                 let repo_path = RepoPath::new(path.as_ref()).ok();
                 let comment_count = *comment_count;
-                let comments_expanded = *comments_expanded;
-                let path_for_toggle = path.clone();
                 let display_name = display_name.clone();
 
                 let file_row = h_flex()
@@ -838,20 +882,11 @@ impl ReviewView {
                             }),
                     )
                     .when(comment_count > 0, |row| {
-                        let chevron = if comments_expanded {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        };
                         row.child(
                             h_flex()
-                                .id(SharedString::from(format!("comment_badge_{}", ix)))
                                 .flex_none()
                                 .gap_1()
                                 .px_1()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .hover(|style| style.bg(cx.theme().colors().element_hover))
                                 .child(
                                     Icon::new(IconName::Chat)
                                         .size(IconSize::XSmall)
@@ -861,15 +896,7 @@ impl ReviewView {
                                     Label::new(comment_count.to_string())
                                         .size(LabelSize::XSmall)
                                         .color(Color::Muted),
-                                )
-                                .child(
-                                    Icon::new(chevron)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Muted),
-                                )
-                                .on_click(cx.listener(move |this, _event, _window, cx| {
-                                    this.toggle_comment_file(path_for_toggle.clone(), cx);
-                                })),
+                                ),
                         )
                     });
 
@@ -885,32 +912,82 @@ impl ReviewView {
             RowKind::Comment {
                 comment,
                 body,
-                path,
+                preview,
+                path: _,
                 depth,
+                expanded,
             } => {
                 let indent = *depth as f32 * TREE_INDENT + 8.0;
-                let repo_path = RepoPath::new(path.as_ref()).ok();
                 let comment_id = comment.id;
-                // Only root comments anchor a reply composer; replies thread
-                // under the same root on GitHub.
                 let is_root = comment.reply_to.is_none();
-                let is_replying = self.replying_to == Some(comment_id);
+                let is_reply = !is_root;
+                // Toggling any row in a thread toggles the whole thread.
+                let thread_id = comment.reply_to.unwrap_or(comment_id);
 
-                let mut card = div()
-                    .id(SharedString::from(format!("comment_{}", ix)))
-                    .child(CommentCard::new(comment.clone(), body.clone()));
-                if let Some(repo_path) = repo_path {
-                    card = card.cursor_pointer().on_click(cx.listener(
-                        move |_this, _event, _window, cx| {
-                            cx.emit(ReviewViewEvent::OpenFileDiff(repo_path.clone()));
-                        },
-                    ));
+                if !*expanded {
+                    return h_flex()
+                        .id(SharedString::from(format!("comment-{comment_id}")))
+                        .pl(px(if is_reply { indent + 16.0 } else { indent }))
+                        .pr_2()
+                        .py_1()
+                        .gap_1()
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                        .child(
+                            Icon::new(IconName::ChevronRight)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(format!("@{}", comment.author))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Default),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_x_hidden()
+                                .child(CommentPreview::new(preview.clone())),
+                        )
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.toggle_comment(thread_id, cx);
+                        }))
+                        .into_any_element();
                 }
 
-                let mut container = v_flex().pl(px(indent)).pr_2().gap_1().child(card);
+                let is_replying = self.replying_to == Some(comment_id);
+                let mut container = v_flex()
+                    .min_w_0()
+                    .pl(px(indent))
+                    .pr_2()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .id(SharedString::from(format!("comment-hdr-{comment_id}")))
+                            .px_2()
+                            .gap_1()
+                            .items_center()
+                            .cursor_pointer()
+                            .child(
+                                Icon::new(IconName::ChevronDown)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(format!("@{}", comment.author))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .on_click(cx.listener(move |this, _, _window, cx| {
+                                this.toggle_comment(thread_id, cx);
+                            })),
+                    )
+                    .child(CommentCard::new(comment.clone(), body.clone()));
                 if is_root && !is_replying {
                     container = container.child(
-                        h_flex().child(
+                        h_flex().pl_2().child(
                             Button::new(
                                 SharedString::from(format!("reply-{comment_id}")),
                                 "Reply",
@@ -930,6 +1007,47 @@ impl ReviewView {
                 }
                 container.into_any_element()
             }
+            RowKind::CommentFileHeader {
+                display_name,
+                path,
+                count,
+            } => {
+                let repo_path = RepoPath::new(path.as_ref()).ok();
+                let row = h_flex()
+                    .id(SharedString::from(format!("comment-file-{ix}")))
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .items_center()
+                    .when(repo_path.is_some(), |el| el.cursor_pointer())
+                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                    .child(
+                        Icon::new(IconName::File)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div().overflow_x_hidden().flex_1().child(
+                            Label::new(display_name.to_string())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Default)
+                                .single_line(),
+                        ),
+                    )
+                    .child(
+                        Label::new(count.to_string())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    );
+                if let Some(repo_path) = repo_path {
+                    row.on_click(cx.listener(move |_this, _, _window, cx| {
+                        cx.emit(ReviewViewEvent::OpenFileDiff(repo_path.clone()));
+                    }))
+                    .into_any_element()
+                } else {
+                    row.into_any_element()
+                }
+            }
             RowKind::GeneralHeader { count } => h_flex()
                 .px_2()
                 .h(px(ROW_HEIGHT))
@@ -943,6 +1061,7 @@ impl ReviewView {
             RowKind::GeneralComment {
                 comment,
                 body,
+                preview,
                 expanded,
             } => {
                 let comment_id = comment.id;
@@ -969,20 +1088,12 @@ impl ReviewView {
                                         .color(Color::Muted),
                                 )
                                 .on_click(cx.listener(move |this, _, _window, cx| {
-                                    this.toggle_general_comment(comment_id, cx);
+                                    this.toggle_comment(comment_id, cx);
                                 })),
                         )
                         .child(CommentCard::new(comment.clone(), body.clone()))
                         .into_any_element()
                 } else {
-                    let preview: String = comment
-                        .body
-                        .lines()
-                        .find(|line| !line.trim().is_empty())
-                        .unwrap_or("")
-                        .chars()
-                        .take(80)
-                        .collect();
                     h_flex()
                         .id(SharedString::from(format!("gc-{comment_id}")))
                         .px_2()
@@ -1002,15 +1113,14 @@ impl ReviewView {
                                 .color(Color::Default),
                         )
                         .child(
-                            div().overflow_x_hidden().flex_1().child(
-                                Label::new(preview)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .single_line(),
-                            ),
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_x_hidden()
+                                .child(CommentPreview::new(preview.clone())),
                         )
                         .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.toggle_general_comment(comment_id, cx);
+                            this.toggle_comment(comment_id, cx);
                         }))
                         .into_any_element()
                 }
@@ -1036,12 +1146,65 @@ impl Render for ReviewView {
         let pr_author = self.selected_pr.author.clone();
         let file_count = self.file_entries.len();
 
-        let weak = cx.weak_entity();
-        let scrollable = list(self.list_state.clone(), move |ix, _window, cx| {
-            weak.update(cx, |this, cx| this.render_row(ix, cx))
+        let files = list(self.file_list_state.clone(), {
+            let weak = cx.weak_entity();
+            move |ix, _window, cx| {
+                weak.update(cx, |this, cx| {
+                    let Some(row) = this.file_rows.get(ix).cloned() else {
+                        return gpui::Empty.into_any_element();
+                    };
+                    this.render_row(row, ix, cx)
+                })
                 .unwrap_or_else(|_| gpui::Empty.into_any_element())
+            }
         })
-        .flex_1();
+        .flex_1()
+        .w_full();
+        let comments = list(self.comment_list_state.clone(), {
+            let weak = cx.weak_entity();
+            move |ix, _window, cx| {
+                weak.update(cx, |this, cx| {
+                    let Some(row) = this.comment_rows.get(ix).cloned() else {
+                        return gpui::Empty.into_any_element();
+                    };
+                    this.render_row(row, ix, cx)
+                })
+                .unwrap_or_else(|_| gpui::Empty.into_any_element())
+            }
+        })
+        .flex_1()
+        .w_full();
+
+        let border = cx.theme().colors().border;
+        let section_header = move |label: &'static str| {
+            h_flex()
+                .flex_none()
+                .px_2()
+                .py_1()
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+        };
+        let files_panel = v_flex()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_x_hidden()
+            .child(section_header("Files"))
+            .child(files);
+        let comments_panel = v_flex()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_x_hidden()
+            .border_t_1()
+            .border_color(border)
+            .child(section_header("Comments"))
+            .child(comments);
 
         v_flex()
             .id("review-thread")
@@ -1081,7 +1244,8 @@ impl Render for ReviewView {
                             .color(Color::Muted),
                     ),
             )
-            .child(scrollable)
+            .child(files_panel)
+            .child(comments_panel)
             .child(
                 v_flex()
                     .flex_none()
