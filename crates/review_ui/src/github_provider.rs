@@ -427,6 +427,10 @@ impl ReviewProvider for GitHubProvider {
             format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/comments?per_page=100");
         let reviews_url =
             format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100");
+        // Conversation comments live on the issues API, distinct from inline
+        // code comments on the pulls API.
+        let issue_comments_url =
+            format!("{GITHUB_API_URL}/repos/{owner}/{repo}/issues/{number}/comments?per_page=100");
         let http_client = self.http_client.clone();
         let token = self.token.clone();
 
@@ -438,8 +442,27 @@ impl ReviewProvider for GitHubProvider {
             // Fetch top-level review submissions (approve, request changes, etc.)
             let gh_reviews: Vec<GhReview> = github_get(&http_client, &token, &reviews_url).await?;
 
+            // Fetch the general PR conversation comments.
+            let gh_issue_comments: Vec<GhIssueComment> =
+                github_get(&http_client, &token, &issue_comments_url).await?;
+
             let mut comments: Vec<ReviewComment> =
                 gh_comments.into_iter().map(map_review_comment).collect();
+
+            // Conversation comments aren't anchored to a file/line, so they
+            // surface in the general comments section.
+            for issue_comment in gh_issue_comments {
+                comments.push(ReviewComment {
+                    id: issue_comment.id,
+                    author: issue_comment.user.login.into(),
+                    body: issue_comment.body.into(),
+                    created_at: issue_comment.created_at.into(),
+                    path: None,
+                    line: None,
+                    reply_to: None,
+                    diff_hunk: None,
+                });
+            }
 
             // Add review-level comments (non-empty body only)
             for review in gh_reviews {
