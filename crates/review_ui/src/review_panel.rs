@@ -1,6 +1,6 @@
 use crate::file_list::{FileList, FileListEvent};
 use crate::github_provider::GitHubProvider;
-use crate::inline_comment::{ApplySuggestion, parse_suggestions, render_pr_comment_block, SuggestionBlock};
+use crate::inline_comment::{ApplySuggestion, comment_markdown, parse_suggestions, render_pr_comment_block, SuggestionBlock};
 use crate::pull_request_list::{PullRequestList, PullRequestListEvent, RemoteState};
 use crate::review_view::{ReviewView, ReviewViewEvent};
 use crate::github_token::resolve_github_token;
@@ -9,13 +9,13 @@ use crate::review_provider::{PullRequestInfo, ReviewComment, ReviewProvider};
 use markdown::Markdown;
 use anyhow::Result;
 use collections::HashMap;
-use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
+use editor::display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
 use editor::Editor;
 use fs::Fs;
 use git::repository::RepoPath;
 use git::status::{DiffTreeType, TreeDiff};
 use gpui::{
-    App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, FocusHandle,
+    AnyElement, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, Pixels, Render, SharedString, Subscription, WeakEntity, Window,
 };
 use text::Point;
@@ -27,8 +27,9 @@ use project::{
 use settings::{self, Settings};
 use std::sync::Arc;
 use ui::{
-    Color, ContextMenu, DynamicSpacing, IconButton, IconName, IconSize, IntoElement, Label,
-    LabelSize, PopoverMenu, PopoverMenuHandle, Tab, Tooltip, h_flex, prelude::*, v_flex,
+    Button, ButtonSize, Color, ContextMenu, DynamicSpacing, IconButton, IconName, IconSize,
+    IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, Tab, Tooltip, div, h_flex,
+    prelude::*, v_flex,
 };
 use workspace::{
     Workspace,
@@ -86,7 +87,17 @@ pub struct ReviewPanel {
     /// Whether the PR's diff has been auto-opened for the current selection.
     pr_diff_opened: bool,
     injected_comment_blocks: HashMap<EntityId, (WeakEntity<Editor>, Vec<CustomBlockId>)>,
+    /// The currently open inline reply composer, if any.
+    inline_composer: Option<InlineComposer>,
     _workspace_subscription: Option<Subscription>,
+}
+
+/// State for the reply composer rendered inside a thread's inline block.
+struct InlineComposer {
+    editor: WeakEntity<Editor>,
+    input: Entity<Editor>,
+    in_reply_to: u64,
+    submitting: bool,
 }
 
 pub fn register(workspace: &mut Workspace) {
@@ -178,6 +189,7 @@ impl ReviewPanel {
             pending_action: None,
             pr_diff_opened: false,
             injected_comment_blocks: HashMap::default(),
+            inline_composer: None,
             _workspace_subscription: workspace_subscription,
         };
         // Create the PR list up front so pull requests start loading in the
@@ -794,6 +806,8 @@ impl ReviewPanel {
         let snapshot = multibuffer.read(cx).snapshot(cx);
         let buffers = multibuffer.read(cx).all_buffers();
 
+        let weak_panel = cx.weak_entity();
+        let weak_editor = editor.downgrade();
         let mut blocks = Vec::new();
         for buffer in buffers {
             let (file_path, buffer_snapshot) = {
@@ -826,12 +840,26 @@ impl ReviewPanel {
                 let Some(anchor) = snapshot.anchor_in_excerpt(text_anchor) else {
                     continue;
                 };
-                let height = Self::estimate_block_height(&thread_comments);
+                let root_id = thread_comments.first().map(|(comment, _, _)| comment.id);
+                let composing = root_id.is_some_and(|id| self.is_composing_for(id));
+                let height = Self::estimate_block_height(&thread_comments)
+                    + 2
+                    + if composing { 12 } else { 0 };
+                let weak_panel = weak_panel.clone();
+                let weak_editor = weak_editor.clone();
                 blocks.push(BlockProperties {
                     placement: BlockPlacement::Below(anchor),
                     height: Some(height),
                     style: BlockStyle::Flex,
-                    render: Arc::new(move |cx| render_pr_comment_block(thread_comments.clone(), cx)),
+                    render: Arc::new(move |cx| {
+                        render_comment_thread_with_reply(
+                            thread_comments.clone(),
+                            root_id,
+                            weak_panel.clone(),
+                            weak_editor.clone(),
+                            cx,
+                        )
+                    }),
                     priority: 0,
                 });
             }
@@ -859,6 +887,9 @@ impl ReviewPanel {
         }
 
         let editor_id = editor.entity_id();
+        let weak_panel = cx.weak_entity();
+        let weak_editor = editor.downgrade();
+        let composing_root = self.inline_composer.as_ref().map(|composer| composer.in_reply_to);
         let block_ids = editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let max_row = snapshot.max_point().row;
@@ -871,14 +902,26 @@ impl ReviewPanel {
                         return None;
                     }
                     let anchor = snapshot.anchor_before(Point::new(row, 0));
-                    let height = Self::estimate_block_height(&thread_comments);
+                    let root_id = thread_comments.first().map(|(comment, _, _)| comment.id);
+                    let composing = root_id.is_some() && root_id == composing_root;
+                    let height = Self::estimate_block_height(&thread_comments)
+                        + 2
+                        + if composing { 12 } else { 0 };
                     let thread_clone = thread_comments;
+                    let weak_panel = weak_panel.clone();
+                    let weak_editor = weak_editor.clone();
                     Some(BlockProperties {
                         placement: BlockPlacement::Below(anchor),
                         height: Some(height),
                         style: BlockStyle::Flex,
                         render: Arc::new(move |cx| {
-                            render_pr_comment_block(thread_clone.clone(), cx)
+                            render_comment_thread_with_reply(
+                                thread_clone.clone(),
+                                root_id,
+                                weak_panel.clone(),
+                                weak_editor.clone(),
+                                cx,
+                            )
                         }),
                         priority: 0,
                     })
@@ -904,6 +947,117 @@ impl ReviewPanel {
         }
     }
 
+    /// Open the reply composer for the thread rooted at `in_reply_to`. The
+    /// composer is rendered inside that thread's existing inline block (no new
+    /// block is inserted), so re-inject to pick up the change.
+    fn begin_inline_reply(
+        &mut self,
+        target_editor: WeakEntity<Editor>,
+        in_reply_to: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = target_editor.upgrade() else {
+            return;
+        };
+
+        let input = cx.new(|cx| {
+            let mut editor = Editor::auto_height(2, 4, window, cx);
+            editor.set_placeholder_text("Reply…", window, cx);
+            editor.set_show_gutter(false, cx);
+            editor.set_show_wrap_guides(false, cx);
+            editor.set_show_indent_guides(false, cx);
+            editor.set_use_autoclose(false);
+            editor
+        });
+        window.focus(&input.focus_handle(cx), cx);
+
+        self.inline_composer = Some(InlineComposer {
+            editor: target_editor,
+            input,
+            in_reply_to,
+            submitting: false,
+        });
+        self.reinject_inline_blocks(&editor, cx);
+        cx.notify();
+    }
+
+    /// True when the reply composer is open for the given thread root.
+    fn is_composing_for(&self, root_id: u64) -> bool {
+        self.inline_composer
+            .as_ref()
+            .is_some_and(|composer| composer.in_reply_to == root_id)
+    }
+
+    fn reinject_inline_blocks(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
+        let Some((review_view, _)) = &self.review_view else {
+            return;
+        };
+        let review_view = review_view.clone();
+        self.remove_all_injected_blocks(cx);
+        self.inject_for_multibuffer_editor(editor, &review_view, cx);
+    }
+
+    fn cancel_inline_composer(&mut self, cx: &mut Context<Self>) {
+        if let Some(composer) = self.inline_composer.take() {
+            if let Some(editor) = composer.editor.upgrade() {
+                self.reinject_inline_blocks(&editor, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn submit_inline_composer(&mut self, cx: &mut Context<Self>) {
+        let Some(composer) = self.inline_composer.as_ref() else {
+            return;
+        };
+        if composer.submitting {
+            return;
+        }
+        let body = composer.input.read(cx).text(cx);
+        if body.trim().is_empty() {
+            return;
+        }
+        let in_reply_to = composer.in_reply_to;
+        let target_editor = composer.editor.clone();
+
+        let (Some(provider), Some(owner), Some(repo), Some(pr)) = (
+            self.provider.clone(),
+            self.remote_owner.clone(),
+            self.remote_repo.clone(),
+            self.selected_pr.as_ref(),
+        ) else {
+            return;
+        };
+        let number = pr.number;
+
+        if let Some(composer) = self.inline_composer.as_mut() {
+            composer.submitting = true;
+        }
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let new_comment = provider
+                .reply_to_comment(&owner, &repo, number, &body, in_reply_to)
+                .await?;
+            this.update(cx, |this, cx| {
+                this.inline_composer = None;
+                if let Some((review_view, _)) = &this.review_view {
+                    let review_view = review_view.clone();
+                    review_view.update(cx, |review_view, cx| {
+                        review_view.add_comment(new_comment, cx);
+                    });
+                    if let Some(editor) = target_editor.upgrade() {
+                        this.reinject_inline_blocks(&editor, cx);
+                    }
+                }
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn build_comment_threads(
         comments: &[ReviewComment],
         cx: &mut App,
@@ -917,9 +1071,7 @@ impl ReviewPanel {
             if comment.reply_to.is_none() {
                 if let Some(line) = comment.line {
                     let (cleaned_body, suggestions) = parse_suggestions(&comment.body);
-                    let md = cx.new(|cx| {
-                        Markdown::new(SharedString::from(cleaned_body), None, None, cx)
-                    });
+                    let md = comment_markdown(SharedString::from(cleaned_body), cx);
                     threads.push((line, vec![(comment.clone(), md, suggestions)]));
                 }
             }
@@ -930,9 +1082,7 @@ impl ReviewPanel {
                 for (_, thread) in &mut threads {
                     if thread.first().map(|(c, _, _)| c.id) == Some(reply_to) {
                         let (cleaned_body, suggestions) = parse_suggestions(&comment.body);
-                        let md = cx.new(|cx| {
-                            Markdown::new(SharedString::from(cleaned_body), None, None, cx)
-                        });
+                        let md = comment_markdown(SharedString::from(cleaned_body), cx);
                         thread.push((comment.clone(), md, suggestions));
                         break;
                     }
@@ -1220,6 +1370,111 @@ impl Panel for ReviewPanel {
     fn activation_priority(&self) -> u32 {
         10
     }
+}
+
+/// Render an inline comment thread block with a trailing Reply button that
+/// opens the reply composer for the thread's root comment.
+fn render_comment_thread_with_reply(
+    thread: Vec<(ReviewComment, Entity<Markdown>, Vec<SuggestionBlock>)>,
+    root_id: Option<u64>,
+    weak_panel: WeakEntity<ReviewPanel>,
+    weak_editor: WeakEntity<Editor>,
+    cx: &mut BlockContext,
+) -> AnyElement {
+    let colors = cx.theme().colors().clone();
+    // Match render_pr_comment_block's inset so the composer lines up under the
+    // comment text rather than spanning the gutter.
+    let anchor_x = cx.anchor_x;
+    let max_width = cx.max_width;
+    let body = render_pr_comment_block(thread, cx);
+    // Fill the whole block (gutter included) with the editor background so the
+    // diff's added/removed gutter bar doesn't bleed through and make the
+    // comment/composer look like part of the code below.
+    let mut container = v_flex()
+        .w_full()
+        .bg(colors.editor_background)
+        .child(body);
+
+    // If the reply composer is open for this thread, render it inline; else show
+    // a Reply button that opens it.
+    let composer = root_id.and_then(|root_id| {
+        weak_panel.upgrade().and_then(|panel| {
+            let panel = panel.read(cx);
+            panel
+                .inline_composer
+                .as_ref()
+                .filter(|composer| composer.in_reply_to == root_id)
+                .map(|composer| (composer.input.clone(), composer.submitting))
+        })
+    });
+
+    if let Some((input, submitting)) = composer {
+        let cancel_panel = weak_panel.clone();
+        container = container.child(
+            v_flex()
+                .max_w(max_width - anchor_x)
+                .pl(anchor_x)
+                .pr_2()
+                .pb_2()
+                .pt_1()
+                .gap_2()
+                .child(
+                    div()
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .bg(colors.element_background)
+                        .child(input),
+                )
+                .child(
+                    h_flex()
+                        .justify_end()
+                        .gap_1()
+                        .child(
+                            Button::new("inline-composer-cancel", "Cancel")
+                                .size(ButtonSize::Compact)
+                                .label_size(LabelSize::Small)
+                                .on_click(move |_, _window, cx| {
+                                    cancel_panel
+                                        .update(cx, |panel, cx| panel.cancel_inline_composer(cx))
+                                        .ok();
+                                }),
+                        )
+                        .child(
+                            Button::new("inline-composer-submit", "Reply")
+                                .size(ButtonSize::Compact)
+                                .label_size(LabelSize::Small)
+                                .style(ui::ButtonStyle::Filled)
+                                .disabled(submitting)
+                                .on_click(move |_, _window, cx| {
+                                    weak_panel
+                                        .update(cx, |panel, cx| panel.submit_inline_composer(cx))
+                                        .ok();
+                                }),
+                        ),
+                ),
+        );
+    } else if let Some(root_id) = root_id {
+        container = container.child(
+            h_flex().pl(anchor_x).pb_1().child(
+                Button::new(("inline-reply", root_id as usize), "Reply")
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Small)
+                    .on_click(move |_, window, cx| {
+                        let weak_editor = weak_editor.clone();
+                        weak_panel
+                            .update(cx, |panel, cx| {
+                                panel.begin_inline_reply(weak_editor, root_id, window, cx);
+                            })
+                            .ok();
+                    }),
+            ),
+        );
+    }
+    container.into_any_element()
 }
 
 fn parse_github_remote(url: &str) -> anyhow::Result<(String, String)> {

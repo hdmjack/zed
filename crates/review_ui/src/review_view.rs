@@ -52,6 +52,9 @@ pub struct ReviewView {
     expanded_dirs: HashSet<SharedString>,
     display_entries: Vec<DisplayEntry>,
     expanded_comment_files: HashSet<SharedString>,
+    /// General (conversation) comment ids that are expanded to their full body;
+    /// collapsed comments show only a first-line preview.
+    expanded_general_comments: HashSet<u64>,
     list_state: ListState,
     // Cached per-data-change so `render` does no per-frame recompute.
     file_entries: Vec<(SharedString, Option<FileChangeStatus>, u32, u32)>,
@@ -87,6 +90,8 @@ enum RowKind {
     },
     GeneralComment {
         comment: ReviewComment,
+        body: Entity<Markdown>,
+        expanded: bool,
     },
     Loading,
 }
@@ -143,6 +148,7 @@ impl ReviewView {
             expanded_dirs: HashSet::default(),
             display_entries: Vec::new(),
             expanded_comment_files: HashSet::default(),
+            expanded_general_comments: HashSet::default(),
             list_state: ListState::new(0, ListAlignment::Top, px(1024.0)),
             file_entries: Vec::new(),
             file_comments: HashMap::default(),
@@ -209,6 +215,14 @@ impl ReviewView {
     fn toggle_comment_file(&mut self, path: SharedString, cx: &mut Context<Self>) {
         if !self.expanded_comment_files.remove(&path) {
             self.expanded_comment_files.insert(path);
+        }
+        self.rebuild(cx);
+        cx.notify();
+    }
+
+    fn toggle_general_comment(&mut self, comment_id: u64, cx: &mut Context<Self>) {
+        if !self.expanded_general_comments.remove(&comment_id) {
+            self.expanded_general_comments.insert(comment_id);
         }
         self.rebuild(cx);
         cx.notify();
@@ -296,9 +310,8 @@ impl ReviewView {
                     if comments_expanded {
                         if let Some(comments) = comments {
                             for comment in comments {
-                                let body = cx.new(|cx| {
-                                    Markdown::new(comment.body.clone(), None, None, cx)
-                                });
+                                let body =
+                                    crate::inline_comment::comment_markdown(comment.body.clone(), cx);
                                 rows.push(RowKind::Comment {
                                     comment: comment.clone(),
                                     body,
@@ -316,8 +329,13 @@ impl ReviewView {
                 count: self.general_comments.len(),
             });
             for comment in &self.general_comments {
+                let expanded = self.expanded_general_comments.contains(&comment.id);
+                let body =
+                    crate::inline_comment::comment_markdown(comment.body.clone(), cx);
                 rows.push(RowKind::GeneralComment {
                     comment: comment.clone(),
+                    body,
+                    expanded,
                 });
             }
         }
@@ -367,6 +385,14 @@ impl ReviewView {
 
     pub fn pr_comments(&self) -> &[ReviewComment] {
         &self.pr_comments
+    }
+
+    /// Append a freshly posted comment and rebuild the cached rows so it shows
+    /// in the sidebar (and so re-injected inline blocks pick it up).
+    pub fn add_comment(&mut self, comment: ReviewComment, cx: &mut Context<Self>) {
+        self.pr_comments.push(comment);
+        self.rebuild(cx);
+        cx.notify();
     }
 
     pub fn comments_for_file(&self, path: &SharedString) -> Vec<ReviewComment> {
@@ -881,7 +907,7 @@ impl ReviewView {
                     ));
                 }
 
-                let mut container = v_flex().pl(px(indent)).gap_1().child(card);
+                let mut container = v_flex().pl(px(indent)).pr_2().gap_1().child(card);
                 if is_root && !is_replying {
                     container = container.child(
                         h_flex().child(
@@ -914,35 +940,80 @@ impl ReviewView {
                         .color(Color::Muted),
                 )
                 .into_any_element(),
-            RowKind::GeneralComment { comment } => {
-                let body_preview: String = comment
-                    .body
-                    .chars()
-                    .take(80)
-                    .collect::<String>()
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .gap_1()
-                    .items_start()
-                    .child(
-                        Label::new(format!("@{}", comment.author))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Default),
-                    )
-                    .child(
-                        div().overflow_x_hidden().flex_1().child(
-                            Label::new(body_preview)
+            RowKind::GeneralComment {
+                comment,
+                body,
+                expanded,
+            } => {
+                let comment_id = comment.id;
+                if *expanded {
+                    v_flex()
+                        .w_full()
+                        .min_w_0()
+                        .px_2()
+                        .child(
+                            h_flex()
+                                .id(SharedString::from(format!("gc-hdr-{comment_id}")))
+                                .px_2()
+                                .gap_1()
+                                .items_center()
+                                .cursor_pointer()
+                                .child(
+                                    Icon::new(IconName::ChevronDown)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(format!("@{}", comment.author))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .on_click(cx.listener(move |this, _, _window, cx| {
+                                    this.toggle_general_comment(comment_id, cx);
+                                })),
+                        )
+                        .child(CommentCard::new(comment.clone(), body.clone()))
+                        .into_any_element()
+                } else {
+                    let preview: String = comment
+                        .body
+                        .lines()
+                        .find(|line| !line.trim().is_empty())
+                        .unwrap_or("")
+                        .chars()
+                        .take(80)
+                        .collect();
+                    h_flex()
+                        .id(SharedString::from(format!("gc-{comment_id}")))
+                        .px_2()
+                        .py_1()
+                        .gap_1()
+                        .items_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                        .child(
+                            Icon::new(IconName::ChevronRight)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(format!("@{}", comment.author))
                                 .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .single_line(),
-                        ),
-                    )
-                    .into_any_element()
+                                .color(Color::Default),
+                        )
+                        .child(
+                            div().overflow_x_hidden().flex_1().child(
+                                Label::new(preview)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .single_line(),
+                            ),
+                        )
+                        .on_click(cx.listener(move |this, _, _window, cx| {
+                            this.toggle_general_comment(comment_id, cx);
+                        }))
+                        .into_any_element()
+                }
             }
             RowKind::Loading => h_flex()
                 .px_2()

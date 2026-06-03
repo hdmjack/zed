@@ -1,6 +1,6 @@
 use crate::review_provider::ReviewComment;
-use gpui::Entity;
-use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use gpui::{Entity, TextStyleRefinement, px};
+use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use ui::{Color, IntoElement, Label, LabelSize, div, h_flex, prelude::*, v_flex};
 
 #[derive(IntoElement)]
@@ -19,13 +19,36 @@ impl CommentCard {
 impl RenderOnce for CommentCard {
     fn render(self, window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
         let is_reply = self.comment.reply_to.is_some();
-        let markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
+        let mut markdown_style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
+        // Comments render denser than editor body text, with restrained headings
+        // so bot comments (which lean on markdown headings heavily) stay compact.
+        markdown_style.base_text_style.font_size = px(11.0).into();
+        markdown_style.base_text_style.line_height = px(16.0).into();
+        markdown_style.inline_code.font_size = Some(px(11.0).into());
+        let heading = |size: f32| TextStyleRefinement {
+            font_size: Some(px(size).into()),
+            line_height: Some(px(size + 4.0).into()),
+            ..Default::default()
+        };
+        markdown_style.heading_level_styles = Some(HeadingLevelStyles {
+            h1: Some(heading(13.0)),
+            h2: Some(heading(12.0)),
+            h3: Some(heading(12.0)),
+            h4: Some(heading(11.0)),
+            h5: Some(heading(11.0)),
+            h6: Some(heading(11.0)),
+        });
 
         let mut card = v_flex()
-            .mx_2()
+            .w_full()
+            // Allow the card to shrink below its content's intrinsic width so long
+            // URLs / code spans wrap instead of overflowing the panel. Horizontal
+            // placement is owned by the call site so margins stay symmetric.
+            .min_w_0()
             .mb_1()
             .p_2()
             .gap_1()
+            .overflow_x_hidden()
             .rounded_md()
             .border_1()
             .border_color(cx.theme().colors().border)
@@ -90,7 +113,16 @@ impl RenderOnce for CommentCard {
             );
         }
 
-        card = card.child(MarkdownElement::new(self.body, markdown_style));
+        card = card.child(
+            div()
+                .w_full()
+                .min_w_0()
+                .overflow_x_hidden()
+                // Markdown text runs inherit the ambient text size (TextRun carries
+                // no font size of its own), so set it on the container.
+                .text_size(px(12.0))
+                .child(MarkdownElement::new(self.body, markdown_style)),
+        );
 
         card
     }

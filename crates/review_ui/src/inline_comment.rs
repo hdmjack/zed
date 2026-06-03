@@ -1,7 +1,7 @@
 use crate::review_provider::ReviewComment;
 use editor::display_map::BlockContext;
-use gpui::{AnyElement, Entity, SharedString};
-use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use gpui::{AnyElement, App, Entity, SharedString};
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
 use ui::{
     Button, ButtonStyle, Color, FluentBuilder, IconName, IntoElement, Label, LabelSize, h_flex,
     prelude::*, v_flex,
@@ -10,6 +10,48 @@ use ui::{
 #[derive(Clone, Debug)]
 pub struct SuggestionBlock {
     pub suggested_code: String,
+}
+
+/// Build a `Markdown` entity for a comment body with HTML parsing enabled, so
+/// GitHub's `<details>`/`<summary>` and other inline HTML render instead of
+/// showing as literal tags.
+pub fn comment_markdown(body: SharedString, cx: &mut App) -> Entity<Markdown> {
+    let cleaned = SharedString::from(sanitize_comment_html(&body));
+    cx.new(|cx| {
+        Markdown::new_with_options(
+            cleaned,
+            None,
+            None,
+            MarkdownOptions {
+                parse_html: true,
+                ..Default::default()
+            },
+            cx,
+        )
+    })
+}
+
+/// Strip HTML noise the markdown renderer can't display inline: HTML comments
+/// (`<!-- ... -->`, often used by bots to stash metadata) and `<sub>`/`<sup>`
+/// wrappers (unwrapped to their inner text).
+fn sanitize_comment_html(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        if let Some(end) = rest[start..].find("-->") {
+            rest = &rest[start + end + 3..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+
+    out.replace("<sub>", "")
+        .replace("</sub>", "")
+        .replace("<sup>", "")
+        .replace("</sup>", "")
 }
 
 /// Extracts ```suggestion fenced blocks from a comment body.
