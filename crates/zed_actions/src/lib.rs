@@ -727,7 +727,9 @@ pub mod review_panel {
             /// Toggles focus on the review UI.
             ToggleFocus,
             /// Opens the selected file in the editor (working tree version).
-            OpenLocalFile
+            OpenLocalFile,
+            /// Adds a PR review comment on the current line or selection.
+            AddComment
         ]
     );
 }
