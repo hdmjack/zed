@@ -126,6 +126,14 @@ pub trait ReviewProvider: Send + Sync {
         number: u32,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<PullRequestDetails>> + Send>>;
 
+    /// Fetch just the PR description (markdown body), which the list query omits.
+    fn fetch_pull_request_body(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u32,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>;
+
     fn fetch_pull_request_files(
         &self,
         owner: &str,

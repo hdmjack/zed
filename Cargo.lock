@@ -15783,6 +15783,8 @@ dependencies = [
  "settings",
  "smol",
  "text",
+ "time",
+ "time_format",
  "ui",
  "workspace",
  "zed_actions",

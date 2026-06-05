@@ -400,6 +400,22 @@ impl ReviewProvider for GitHubProvider {
         })
     }
 
+    fn fetch_pull_request_body(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u32,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>> {
+        let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}");
+        let http_client = self.http_client.clone();
+        let token = self.token.clone();
+
+        Box::pin(async move {
+            let gh_pr: GhPullRequest = github_get(&http_client, &token, &url).await?;
+            Ok(gh_pr.body.unwrap_or_default())
+        })
+    }
+
     fn fetch_pull_request_files(
         &self,
         owner: &str,

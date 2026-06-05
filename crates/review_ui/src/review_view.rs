@@ -1,13 +1,14 @@
 use crate::comment_card::{CommentCard, CommentPreview};
 use crate::file_list::{DisplayEntry, ViewMode, build_file_tree, flatten_file_tree};
 use crate::review_provider::{
-    FileChangeStatus, PullRequestFile, PullRequestInfo, ReviewComment, ReviewProvider, ReviewStatus,
+    FileChangeStatus, PullRequestFile, PullRequestInfo, PullRequestState, ReviewComment,
+    ReviewProvider, ReviewStatus,
 };
 use collections::{HashMap, HashSet};
 use editor::Editor;
 use git::repository::RepoPath;
 use git::status::{TreeDiff, TreeDiffStatus};
-use markdown::Markdown;
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use gpui::{
     Anchor, AnyElement, Context, Entity, EventEmitter, Focusable, ListAlignment, ListState, Render,
     SharedString, Window, list, px,
@@ -34,6 +35,9 @@ pub struct ReviewView {
     remote_owner: Option<String>,
     remote_repo: Option<String>,
     selected_pr: PullRequestInfo,
+    /// PR description markdown, fetched lazily (the list query omits the body).
+    description: Option<Entity<Markdown>>,
+    description_expanded: bool,
     pr_comments: Vec<ReviewComment>,
     pr_comments_loading: bool,
     pr_api_files: Vec<PullRequestFile>,
@@ -113,6 +117,24 @@ enum RowKind {
 
 impl EventEmitter<ReviewViewEvent> for ReviewView {}
 
+/// Format a GitHub ISO-8601 timestamp as a relative string (e.g. "3 days ago"),
+/// matching git blame's relative timestamps. Falls back to the raw string.
+fn format_pr_date(iso: &str) -> String {
+    use time::format_description::well_known::Rfc3339;
+    match time::OffsetDateTime::parse(iso, &Rfc3339) {
+        Ok(timestamp) => {
+            let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+            time_format::format_localized_timestamp(
+                timestamp,
+                time::OffsetDateTime::now_utc(),
+                offset,
+                time_format::TimestampFormat::Relative,
+            )
+        }
+        Err(_) => iso.to_string(),
+    }
+}
+
 /// Markdown source for a collapsed comment's one-line preview: the first
 /// non-empty line with leading block markers (heading/quote/list) stripped so
 /// it renders as a plain paragraph, but inline emphasis/code kept so the
@@ -162,6 +184,8 @@ impl ReviewView {
             remote_owner,
             remote_repo,
             selected_pr: pull_request,
+            description: None,
+            description_expanded: false,
             pr_comments: Vec::new(),
             pr_comments_loading: false,
             pr_api_files: Vec::new(),
@@ -187,7 +211,32 @@ impl ReviewView {
         };
         this.load_pr_comments(pr_number, cx);
         this.load_pr_api_files(pr_number, cx);
+        this.load_pr_body(pr_number, cx);
         this
+    }
+
+    fn load_pr_body(&mut self, pr_number: u32, cx: &mut Context<Self>) {
+        let (Some(provider), Some(owner), Some(repo)) = (
+            self.provider.clone(),
+            self.remote_owner.clone(),
+            self.remote_repo.clone(),
+        ) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let body = provider
+                .fetch_pull_request_body(&owner, &repo, pr_number)
+                .await?;
+            this.update(cx, |this, cx| {
+                if !body.trim().is_empty() {
+                    this.description =
+                        Some(crate::inline_comment::comment_markdown(body.into(), cx));
+                    cx.notify();
+                }
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     pub fn set_tree_diff(&mut self, tree_diff: Option<&TreeDiff>, cx: &mut Context<Self>) {
@@ -248,6 +297,148 @@ impl ReviewView {
         }
         self.rebuild(cx);
         cx.notify();
+    }
+
+    fn toggle_description(&mut self, cx: &mut Context<Self>) {
+        self.description_expanded = !self.description_expanded;
+        cx.notify();
+    }
+
+    /// PR state / review-status / dates badges, plus a collapsible description.
+    fn render_metadata(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let pr = &self.selected_pr;
+        let colors = cx.theme().colors().clone();
+
+        let (state_label, state_color) = if pr.is_draft {
+            ("Draft", Color::Muted)
+        } else {
+            match pr.state {
+                PullRequestState::Open => ("Open", Color::Created),
+                PullRequestState::Merged => ("Merged", Color::Accent),
+                PullRequestState::Closed | PullRequestState::All => ("Closed", Color::Error),
+            }
+        };
+        let review = match pr.review_status {
+            ReviewStatus::Approved => Some(("Approved", Color::Created)),
+            ReviewStatus::ChangesRequested => Some(("Changes requested", Color::Error)),
+            ReviewStatus::Commented => Some(("Commented", Color::Muted)),
+            ReviewStatus::Pending => None,
+        };
+        let pill = |label: &str, color: Color, border: gpui::Hsla, bg: gpui::Hsla| {
+            div()
+                .px_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(border)
+                .bg(bg)
+                .child(Label::new(label.to_string()).size(LabelSize::XSmall).color(color))
+        };
+
+        let dates = format!(
+            "opened {} · updated {}",
+            format_pr_date(&pr.created_at),
+            format_pr_date(&pr.updated_at)
+        );
+
+        let mut block = v_flex()
+            .flex_none()
+            .px_2()
+            .py_1()
+            .gap_1()
+            .border_b_1()
+            .border_color(colors.border)
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .flex_wrap()
+                    .child(pill(
+                        state_label,
+                        state_color,
+                        colors.border_variant,
+                        colors.element_background,
+                    ))
+                    .children(review.map(|(label, color)| {
+                        pill(label, color, colors.border_variant, colors.element_background)
+                    }))
+                    .child(
+                        Label::new(dates)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            );
+
+        if let Some(description) = self.description.clone() {
+            let expanded = self.description_expanded;
+            block = block.child(
+                h_flex()
+                    .id("pr-description-toggle")
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(colors.element_hover))
+                    .child(
+                        Icon::new(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("Description")
+                            .size(LabelSize::Small)
+                            .color(Color::Default),
+                    )
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.toggle_description(cx);
+                    })),
+            );
+            if expanded {
+                let mut style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
+                style.base_text_style.color = colors.text;
+                style.base_text_style.font_size = px(11.0).into();
+                let heading = |size: f32| gpui::TextStyleRefinement {
+                    font_size: Some(px(size).into()),
+                    line_height: Some(px(size + 4.0).into()),
+                    ..Default::default()
+                };
+                style.heading_level_styles = Some(markdown::HeadingLevelStyles {
+                    h1: Some(heading(16.0)),
+                    h2: Some(heading(14.0)),
+                    h3: Some(heading(13.0)),
+                    h4: Some(heading(12.0)),
+                    h5: Some(heading(12.0)),
+                    h6: Some(heading(11.0)),
+                });
+                let max_height = window.viewport_size().height * 0.5;
+                block = block.child(
+                    div()
+                        .id("pr-description-body")
+                        .w_full()
+                        .min_w_0()
+                        .mb_1()
+                        .px_2()
+                        .pt_2()
+                        .pb_4()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.editor_background)
+                        .overflow_x_hidden()
+                        .max_h(max_height)
+                        .overflow_y_scroll()
+                        .text_size(px(11.0))
+                        .child(MarkdownElement::new(description, style)),
+                );
+            }
+        }
+        block
     }
 
     /// Recompute all cached state (file entries, grouped comments, display
@@ -1144,7 +1335,7 @@ impl ReviewView {
 }
 
 impl Render for ReviewView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pr_number = self.selected_pr.number;
         let pr_title = self.selected_pr.title.clone();
         let pr_author = self.selected_pr.author.clone();
@@ -1248,6 +1439,7 @@ impl Render for ReviewView {
                             .color(Color::Muted),
                     ),
             )
+            .child(self.render_metadata(window, cx))
             .child(files_panel)
             .child(comments_panel)
             .child(
