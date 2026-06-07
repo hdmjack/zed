@@ -116,6 +116,8 @@ pub enum MergeMethod {
 #[derive(Clone, Debug)]
 pub struct PullRequestInfo {
     pub number: u32,
+    /// GraphQL global node id (needed for viewed-file mutations).
+    pub node_id: SharedString,
     pub title: SharedString,
     pub author: SharedString,
     pub description: SharedString,
@@ -248,20 +250,19 @@ pub trait ReviewProvider: Send + Sync {
         Box::pin(async { Err(anyhow::anyhow!("merge not supported by this provider")) })
     }
 
+    /// Paths the current user has marked as viewed on this PR (by GraphQL node id).
+    fn fetch_viewed_files(
+        &self,
+        pr_node_id: &str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send>>;
+
+    /// Mark/unmark a file as viewed on the PR identified by its GraphQL node id.
     fn mark_file_viewed(
         &self,
-        _owner: &str,
-        _repo: &str,
-        _number: u32,
-        _path: &str,
-        _viewed: bool,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
-        Box::pin(async {
-            Err(anyhow::anyhow!(
-                "mark file viewed not supported by this provider"
-            ))
-        })
-    }
+        pr_node_id: &str,
+        path: &str,
+        viewed: bool,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
 
     fn request_reviewers(
         &self,

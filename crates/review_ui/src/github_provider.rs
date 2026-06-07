@@ -13,6 +13,7 @@ const GITHUB_API_URL: &str = "https://api.github.com";
 #[derive(Deserialize)]
 struct GhPullRequest {
     number: u32,
+    node_id: String,
     title: String,
     user: GhUser,
     body: Option<String>,
@@ -154,6 +155,7 @@ fn map_file_status(status: &str, previous_filename: Option<String>) -> FileChang
 fn map_pull_request(pr: GhPullRequest) -> PullRequestInfo {
     PullRequestInfo {
         number: pr.number,
+        node_id: pr.node_id.into(),
         title: pr.title.into(),
         author: pr.user.login.into(),
         description: pr.body.unwrap_or_default().into(),
@@ -239,6 +241,7 @@ struct GqlPageInfo {
 #[serde(rename_all = "camelCase")]
 struct GqlPullRequest {
     number: u32,
+    id: String,
     title: String,
     state: String,
     created_at: String,
@@ -317,6 +320,41 @@ struct GqlRollup {
     state: String,
 }
 
+#[derive(Deserialize)]
+struct ViewedFilesResponse {
+    data: Option<ViewedFilesData>,
+    #[serde(default)]
+    errors: Vec<GraphQlError>,
+}
+
+#[derive(Deserialize)]
+struct ViewedFilesData {
+    node: Option<ViewedFilesNode>,
+}
+
+#[derive(Deserialize)]
+struct ViewedFilesNode {
+    files: Option<ViewedFilesConn>,
+}
+
+#[derive(Deserialize)]
+struct ViewedFilesConn {
+    nodes: Vec<ViewedFileNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ViewedFileNode {
+    path: String,
+    viewer_viewed_state: String,
+}
+
+#[derive(Deserialize)]
+struct MutationResponse {
+    #[serde(default)]
+    errors: Vec<GraphQlError>,
+}
+
 fn map_check_rollup(state: &str) -> CheckRollup {
     match state {
         "SUCCESS" => CheckRollup::Success,
@@ -344,6 +382,7 @@ fn map_review_decision(decision: Option<&str>) -> ReviewStatus {
 fn map_graphql_pr(pr: GqlPullRequest) -> PullRequestInfo {
     PullRequestInfo {
         number: pr.number,
+        node_id: pr.id.into(),
         title: pr.title.into(),
         author: pr.author.map(|a| a.login).unwrap_or_default().into(),
         // The list doesn't render the body; fetch it lazily with PR details.
@@ -421,7 +460,7 @@ impl ReviewProvider for GitHubProvider {
                    totalCount \
                    pageInfo {{ hasNextPage endCursor }} \
                    nodes {{ \
-                     number title state createdAt updatedAt isDraft \
+                     id number title state createdAt updatedAt isDraft \
                      baseRefName headRefName baseRefOid headRefOid \
                      author {{ login }} reviewDecision \
                      mergeable \
@@ -510,6 +549,92 @@ impl ReviewProvider for GitHubProvider {
         Box::pin(async move {
             let gh_pr: GhPullRequest = github_get(&http_client, &token, &url).await?;
             Ok(gh_pr.body.unwrap_or_default())
+        })
+    }
+
+    fn fetch_viewed_files(
+        &self,
+        pr_node_id: &str,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send>> {
+        let query = "query($id: ID!) { \
+               node(id: $id) { \
+                 ... on PullRequest { files(first: 100) { nodes { path viewerViewedState } } } \
+               } \
+             }";
+        let id = pr_node_id.to_string();
+        let url = format!("{GITHUB_API_URL}/graphql");
+        let http_client = self.http_client.clone();
+        let token = self.token.clone();
+
+        Box::pin(async move {
+            let body = serde_json::json!({ "query": query, "variables": { "id": id } }).to_string();
+            let response: ViewedFilesResponse =
+                github_post(&http_client, &token, &url, body).await?;
+            if !response.errors.is_empty() {
+                let message = response
+                    .errors
+                    .into_iter()
+                    .map(|error| error.message)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                bail!("GitHub GraphQL error: {message}");
+            }
+            let viewed = response
+                .data
+                .and_then(|data| data.node)
+                .and_then(|node| node.files)
+                .map(|files| {
+                    files
+                        .nodes
+                        .into_iter()
+                        .filter(|file| file.viewer_viewed_state == "VIEWED")
+                        .map(|file| file.path)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(viewed)
+        })
+    }
+
+    fn mark_file_viewed(
+        &self,
+        pr_node_id: &str,
+        path: &str,
+        viewed: bool,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+        let mutation = if viewed {
+            "markFileAsViewed"
+        } else {
+            "unmarkFileAsViewed"
+        };
+        let query = format!(
+            "mutation($id: ID!, $path: String!) {{ \
+               {mutation}(input: {{ pullRequestId: $id, path: $path }}) {{ clientMutationId }} \
+             }}"
+        );
+        let id = pr_node_id.to_string();
+        let path = path.to_string();
+        let url = format!("{GITHUB_API_URL}/graphql");
+        let http_client = self.http_client.clone();
+        let token = self.token.clone();
+
+        Box::pin(async move {
+            let body = serde_json::json!({
+                "query": query,
+                "variables": { "id": id, "path": path },
+            })
+            .to_string();
+            let response: MutationResponse = github_post(&http_client, &token, &url, body).await?;
+            if !response.errors.is_empty() {
+                let message = response
+                    .errors
+                    .into_iter()
+                    .map(|error| error.message)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                bail!("GitHub GraphQL error: {message}");
+            }
+            Ok(())
         })
     }
 

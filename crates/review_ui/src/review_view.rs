@@ -15,9 +15,9 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    Button, ButtonLike, ButtonSize, Color, ContextMenu, ElevationIndex, Icon, IconButton, IconName,
-    IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, SplitButton, Tooltip,
-    div, h_flex, prelude::*, v_flex,
+    Button, ButtonLike, ButtonSize, Checkbox, Color, ContextMenu, ElevationIndex, Icon, IconButton,
+    IconName, IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, SplitButton,
+    ToggleState, Tooltip, div, h_flex, prelude::*, v_flex,
 };
 
 pub enum ReviewViewEvent {
@@ -60,6 +60,8 @@ pub struct ReviewView {
     /// General (conversation) comment ids that are expanded to their full body;
     /// collapsed comments show only a first-line preview.
     expanded_comments: HashSet<u64>,
+    /// File paths the user has marked viewed (synced with GitHub).
+    viewed_files: HashSet<SharedString>,
     // Files panel (top) and comments panel (bottom) are separate virtualized
     // lists with their own scroll state.
     file_list_state: ListState,
@@ -87,6 +89,7 @@ enum RowKind {
         display_name: SharedString,
         path: SharedString,
         comment_count: usize,
+        viewed: bool,
     },
     Comment {
         comment: ReviewComment,
@@ -211,6 +214,7 @@ impl ReviewView {
             expanded_dirs: HashSet::default(),
             display_entries: Vec::new(),
             expanded_comments: HashSet::default(),
+            viewed_files: HashSet::default(),
             file_list_state: ListState::new(0, ListAlignment::Top, px(1024.0)),
             comment_list_state: ListState::new(0, ListAlignment::Top, px(1024.0)),
             file_entries: Vec::new(),
@@ -223,7 +227,55 @@ impl ReviewView {
         this.load_pr_api_files(pr_number, cx);
         this.load_pr_body(pr_number, cx);
         this.load_pr_status(pr_number, cx);
+        this.load_viewed_files(cx);
         this
+    }
+
+    fn load_viewed_files(&mut self, cx: &mut Context<Self>) {
+        let Some(provider) = self.provider.clone() else {
+            return;
+        };
+        let node_id = self.selected_pr.node_id.to_string();
+        if node_id.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let viewed = provider.fetch_viewed_files(&node_id).await?;
+            this.update(cx, |this, cx| {
+                this.viewed_files = viewed.into_iter().map(SharedString::from).collect();
+                this.rebuild(cx);
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    pub fn is_file_viewed(&self, path: &str) -> bool {
+        self.viewed_files.iter().any(|p| p.as_ref() == path)
+    }
+
+    pub fn toggle_file_viewed(&mut self, path: SharedString, cx: &mut Context<Self>) {
+        let viewed = !self.viewed_files.contains(&path);
+        if viewed {
+            self.viewed_files.insert(path.clone());
+        } else {
+            self.viewed_files.remove(&path);
+        }
+        self.rebuild(cx);
+        cx.notify();
+
+        let (Some(provider), Some(node_id)) = (
+            self.provider.clone(),
+            Some(self.selected_pr.node_id.to_string()).filter(|id| !id.is_empty()),
+        ) else {
+            return;
+        };
+        cx.spawn(async move |_this, _cx| {
+            provider.mark_file_viewed(&node_id, &path, viewed).await?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn load_pr_status(&mut self, pr_number: u32, cx: &mut Context<Self>) {
@@ -574,12 +626,14 @@ impl ReviewView {
                     };
                     let path = path.clone();
                     let comment_count = self.file_comments.get(&path).map_or(0, |c| c.len());
+                    let viewed = self.viewed_files.contains(&path);
                     file_rows.push(RowKind::File {
                         entry_index: *entry_index,
                         depth: *depth,
                         display_name: display_name.clone(),
                         path,
                         comment_count,
+                        viewed,
                     });
                 }
             }
@@ -1084,6 +1138,7 @@ impl ReviewView {
                 display_name,
                 path,
                 comment_count,
+                viewed,
             } => {
                 let (status, additions, deletions) = match self.file_entries.get(*entry_index) {
                     Some((_, status, additions, deletions)) => {
@@ -1102,6 +1157,8 @@ impl ReviewView {
                 let repo_path = RepoPath::new(path.as_ref()).ok();
                 let comment_count = *comment_count;
                 let display_name = display_name.clone();
+                let is_viewed = *viewed;
+                let viewed_path = path.clone();
 
                 let file_row = h_flex()
                     .id(SharedString::from(format!("pr_file_{}", ix)))
@@ -1122,6 +1179,11 @@ impl ReviewView {
                             .child(
                                 Label::new(display_name.to_string())
                                     .size(LabelSize::Small)
+                                    .color(if is_viewed {
+                                        Color::Muted
+                                    } else {
+                                        Color::Default
+                                    })
                                     .single_line(),
                             )
                             .when(additions > 0, |el| {
@@ -1156,6 +1218,23 @@ impl ReviewView {
                                         .color(Color::Muted),
                                 ),
                         )
+                    })
+                    .child({
+                        let weak = cx.weak_entity();
+                        Checkbox::new(
+                            SharedString::from(format!("pr_file_viewed_{}", ix)),
+                            if is_viewed {
+                                ToggleState::Selected
+                            } else {
+                                ToggleState::Unselected
+                            },
+                        )
+                        .on_click_ext(move |_state, _event, _window, cx| {
+                            cx.stop_propagation();
+                            let viewed_path = viewed_path.clone();
+                            weak.update(cx, |this, cx| this.toggle_file_viewed(viewed_path, cx))
+                                .ok();
+                        })
                     });
 
                 let file_row = if let Some(repo_path) = repo_path {
@@ -1434,25 +1513,32 @@ impl Render for ReviewView {
         .w_full();
 
         let border = cx.theme().colors().border;
-        let section_header = move |label: &'static str| {
+        let section_header = move |label: SharedString| {
             h_flex()
                 .flex_none()
                 .px_2()
                 .py_1()
                 .border_b_1()
                 .border_color(border)
-                .child(
-                    Label::new(label)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
+                .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
+        };
+        let total_files = self.file_entries.len();
+        let viewed_files = self
+            .file_entries
+            .iter()
+            .filter(|(path, _, _, _)| self.viewed_files.contains(path))
+            .count();
+        let files_label = if total_files > 0 {
+            SharedString::from(format!("Files — {viewed_files}/{total_files} viewed"))
+        } else {
+            SharedString::from("Files")
         };
         let files_panel = v_flex()
             .flex_1()
             .min_h_0()
             .min_w_0()
             .overflow_x_hidden()
-            .child(section_header("Files"))
+            .child(section_header(files_label))
             .child(files);
         let comments_panel = v_flex()
             .flex_1()
@@ -1461,7 +1547,7 @@ impl Render for ReviewView {
             .overflow_x_hidden()
             .border_t_1()
             .border_color(border)
-            .child(section_header("Comments"))
+            .child(section_header(SharedString::from("Comments")))
             .child(comments);
 
         v_flex()

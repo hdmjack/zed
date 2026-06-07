@@ -10,7 +10,8 @@ use markdown::Markdown;
 use anyhow::Result;
 use collections::HashMap;
 use editor::display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
-use editor::Editor;
+use editor::{Addon, Editor};
+use multi_buffer::ExcerptBoundaryInfo;
 use fs::Fs;
 use git::repository::RepoPath;
 use git::status::{DiffTreeType, TreeDiff};
@@ -27,9 +28,9 @@ use project::{
 use settings::{self, Settings};
 use std::sync::Arc;
 use ui::{
-    Button, ButtonSize, Color, ContextMenu, DynamicSpacing, IconButton, IconName, IconSize,
-    IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, Tab, Tooltip, div, h_flex,
-    prelude::*, v_flex,
+    Button, ButtonSize, Checkbox, Color, ContextMenu, DynamicSpacing, IconButton, IconName,
+    IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, Tab, ToggleState,
+    Tooltip, div, h_flex, prelude::*, v_flex,
 };
 use workspace::{
     Workspace,
@@ -112,6 +113,50 @@ enum ComposerTarget {
         start_line: Option<u32>,
         line: u32,
     },
+}
+
+/// Editor addon that adds a "viewed" checkbox to each file's buffer header in
+/// the PR diff, toggling the same per-file viewed state as the Files panel.
+struct ReviewEditorAddon {
+    review_view: WeakEntity<ReviewView>,
+}
+
+impl Addon for ReviewEditorAddon {
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn render_buffer_header_controls(
+        &self,
+        _excerpt: &ExcerptBoundaryInfo,
+        buffer: &language::BufferSnapshot,
+        _window: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let file = buffer.file()?;
+        let path =
+            SharedString::from(file.path().as_std_path().to_string_lossy().to_string());
+        let review_view = self.review_view.upgrade()?;
+        let is_viewed = review_view.read(cx).is_file_viewed(&path);
+        let review_view = self.review_view.clone();
+        Some(
+            Checkbox::new(
+                SharedString::from(format!("review-viewed-{path}")),
+                if is_viewed {
+                    ToggleState::Selected
+                } else {
+                    ToggleState::Unselected
+                },
+            )
+            .on_click(move |_state, _window, cx| {
+                let path = path.clone();
+                review_view
+                    .update(cx, |this, cx| this.toggle_file_viewed(path, cx))
+                    .ok();
+            })
+            .into_any_element(),
+        )
+    }
 }
 
 pub fn register(workspace: &mut Workspace) {
@@ -802,6 +847,14 @@ impl ReviewPanel {
         let Some(editor) = item.act_as::<Editor>(cx) else {
             return;
         };
+
+        // Add the per-file "viewed" checkbox to the diff editor's buffer headers.
+        if editor.read(cx).addon::<ReviewEditorAddon>().is_none() {
+            let review_view = review_view.downgrade();
+            editor.update(cx, |editor, _cx| {
+                editor.register_addon(ReviewEditorAddon { review_view });
+            });
+        }
 
         let editor_id = editor.entity_id();
         if self.injected_comment_blocks.contains_key(&editor_id) {
