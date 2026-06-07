@@ -274,16 +274,18 @@ impl PullRequestList {
                 .child(Icon::new(icon).size(IconSize::XSmall).color(color))
         });
         let review_icon = match pr.review_status {
-            ReviewStatus::Approved => Some((IconName::ThumbsUp, Color::Created)),
-            ReviewStatus::ChangesRequested => Some((IconName::ThumbsDown, Color::Error)),
+            ReviewStatus::Approved => Some((IconName::ThumbsUp, Color::Created, "Approved")),
+            ReviewStatus::ChangesRequested => {
+                Some((IconName::ThumbsDown, Color::Error, "Changes requested"))
+            }
             _ => None,
         };
         let conflicts = pr.mergeable == Some(false);
-        let extra_labels = pr.labels.len().saturating_sub(2);
+        let extra_labels = pr.labels.len().saturating_sub(4);
         let label_pills: Vec<(SharedString, gpui::Hsla)> = pr
             .labels
             .iter()
-            .take(2)
+            .take(4)
             .map(|l| (l.name.clone(), label_hsla(&l.color)))
             .collect();
 
@@ -292,14 +294,22 @@ impl PullRequestList {
             .gap_1()
             .items_center()
             .children(checks_icon)
-            .children(
-                review_icon.map(|(icon, color)| Icon::new(icon).size(IconSize::XSmall).color(color)),
-            )
+            .children(review_icon.map(|(icon, color, tip)| {
+                div()
+                    .id(("pr-review", number as usize))
+                    .tooltip(Tooltip::text(tip))
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+            }))
             .when(conflicts, |row| {
                 row.child(
-                    Icon::new(IconName::GitMergeConflict)
-                        .size(IconSize::XSmall)
-                        .color(Color::Error),
+                    div()
+                        .id(("pr-conflict", number as usize))
+                        .tooltip(Tooltip::text("Merge conflict"))
+                        .child(
+                            Icon::new(IconName::GitMergeConflict)
+                                .size(IconSize::XSmall)
+                                .color(Color::Error),
+                        ),
                 )
             });
 
