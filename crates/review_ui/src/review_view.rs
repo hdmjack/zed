@@ -1,8 +1,8 @@
 use crate::comment_card::{CommentCard, CommentPreview};
 use crate::file_list::{DisplayEntry, ViewMode, build_file_tree, flatten_file_tree};
 use crate::review_provider::{
-    FileChangeStatus, PullRequestFile, PullRequestInfo, PullRequestState, ReviewComment,
-    ReviewProvider, ReviewStatus,
+    CheckRollup, FileChangeStatus, PullRequestFile, PullRequestInfo, PullRequestState,
+    PullRequestStatus, ReviewComment, ReviewProvider, ReviewStatus,
 };
 use collections::{HashMap, HashSet};
 use editor::Editor;
@@ -38,6 +38,8 @@ pub struct ReviewView {
     /// PR description markdown, fetched lazily (the list query omits the body).
     description: Option<Entity<Markdown>>,
     description_expanded: bool,
+    /// Mergeability, CI rollup, and labels, fetched on selection.
+    status: Option<PullRequestStatus>,
     pr_comments: Vec<ReviewComment>,
     pr_comments_loading: bool,
     pr_api_files: Vec<PullRequestFile>,
@@ -117,6 +119,13 @@ enum RowKind {
 
 impl EventEmitter<ReviewViewEvent> for ReviewView {}
 
+/// Parse a GitHub label hex color (e.g. "1d76db") into a UI color.
+fn label_color(hex: &str) -> Color {
+    u32::from_str_radix(hex.trim_start_matches('#'), 16)
+        .map(|rgb| Color::Custom(gpui::rgb(rgb).into()))
+        .unwrap_or(Color::Muted)
+}
+
 /// Format a GitHub ISO-8601 timestamp as a relative string (e.g. "3 days ago"),
 /// matching git blame's relative timestamps. Falls back to the raw string.
 fn format_pr_date(iso: &str) -> String {
@@ -186,6 +195,7 @@ impl ReviewView {
             selected_pr: pull_request,
             description: None,
             description_expanded: false,
+            status: None,
             pr_comments: Vec::new(),
             pr_comments_loading: false,
             pr_api_files: Vec::new(),
@@ -212,7 +222,29 @@ impl ReviewView {
         this.load_pr_comments(pr_number, cx);
         this.load_pr_api_files(pr_number, cx);
         this.load_pr_body(pr_number, cx);
+        this.load_pr_status(pr_number, cx);
         this
+    }
+
+    fn load_pr_status(&mut self, pr_number: u32, cx: &mut Context<Self>) {
+        let (Some(provider), Some(owner), Some(repo)) = (
+            self.provider.clone(),
+            self.remote_owner.clone(),
+            self.remote_repo.clone(),
+        ) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let status = provider
+                .fetch_pull_request_status(&owner, &repo, pr_number)
+                .await?;
+            this.update(cx, |this, cx| {
+                this.status = Some(status);
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn load_pr_body(&mut self, pr_number: u32, cx: &mut Context<Self>) {
@@ -361,10 +393,41 @@ impl ReviewView {
                     .children(review.map(|(label, color)| {
                         pill(label, color, colors.border_variant, colors.element_background)
                     }))
+                    .children(self.status.as_ref().and_then(|s| s.mergeable).map(|m| {
+                        let (label, color) = if m {
+                            ("Mergeable", Color::Created)
+                        } else {
+                            ("Conflicts", Color::Error)
+                        };
+                        pill(label, color, colors.border_variant, colors.element_background)
+                    }))
+                    .children(self.status.as_ref().and_then(|s| s.checks).map(|rollup| {
+                        let (label, color) = match rollup {
+                            CheckRollup::Success => ("Checks passed", Color::Created),
+                            CheckRollup::Failure => ("Checks failing", Color::Error),
+                            CheckRollup::Pending => ("Checks running", Color::Muted),
+                        };
+                        pill(label, color, colors.border_variant, colors.element_background)
+                    }))
                     .child(
                         Label::new(dates)
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
+                    )
+                    .children(
+                        self.status
+                            .as_ref()
+                            .map(|s| s.labels.clone())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|label| {
+                                pill(
+                                    label.name.as_ref(),
+                                    label_color(&label.color),
+                                    colors.border_variant,
+                                    colors.element_background,
+                                )
+                            }),
                     ),
             );
 

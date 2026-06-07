@@ -64,6 +64,29 @@ pub enum CheckStatus {
     Cancelled,
 }
 
+/// Aggregate CI rollup state for a PR's head commit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CheckRollup {
+    Success,
+    Failure,
+    Pending,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrLabel {
+    pub name: SharedString,
+    /// 6-digit hex color (no leading '#'), as GitHub returns it.
+    pub color: SharedString,
+}
+
+/// Mergeability, CI rollup, and labels for a PR — fetched together on selection.
+#[derive(Clone, Debug, Default)]
+pub struct PullRequestStatus {
+    pub mergeable: Option<bool>,
+    pub checks: Option<CheckRollup>,
+    pub labels: Vec<PrLabel>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CheckRun {
     pub name: SharedString,
@@ -105,6 +128,9 @@ pub struct PullRequestInfo {
     pub updated_at: SharedString,
     pub review_status: ReviewStatus,
     pub is_draft: bool,
+    pub mergeable: Option<bool>,
+    pub checks: Option<CheckRollup>,
+    pub labels: Vec<PrLabel>,
 }
 
 pub trait ReviewProvider: Send + Sync {
@@ -133,6 +159,14 @@ pub trait ReviewProvider: Send + Sync {
         repo: &str,
         number: u32,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>;
+
+    /// Fetch mergeability, CI check rollup, and labels in one request.
+    fn fetch_pull_request_status(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u32,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PullRequestStatus>> + Send>>;
 
     fn fetch_pull_request_files(
         &self,

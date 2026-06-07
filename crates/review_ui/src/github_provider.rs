@@ -166,6 +166,9 @@ fn map_pull_request(pr: GhPullRequest) -> PullRequestInfo {
         updated_at: pr.updated_at.into(),
         review_status: ReviewStatus::Pending,
         is_draft: pr.draft,
+        mergeable: None,
+        checks: None,
+        labels: Vec::new(),
     }
 }
 
@@ -247,11 +250,79 @@ struct GqlPullRequest {
     author: Option<GqlAuthor>,
     review_decision: Option<String>,
     is_draft: bool,
+    mergeable: Option<String>,
+    labels: Option<GqlLabels>,
+    commits: Option<GqlCommits>,
 }
 
 #[derive(Deserialize)]
 struct GqlAuthor {
     login: String,
+}
+
+#[derive(Deserialize)]
+struct PrStatusResponse {
+    data: Option<PrStatusData>,
+    #[serde(default)]
+    errors: Vec<GraphQlError>,
+}
+
+#[derive(Deserialize)]
+struct PrStatusData {
+    repository: Option<PrStatusRepo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrStatusRepo {
+    pull_request: Option<GqlPrStatus>,
+}
+
+#[derive(Deserialize)]
+struct GqlPrStatus {
+    mergeable: Option<String>,
+    labels: Option<GqlLabels>,
+    commits: Option<GqlCommits>,
+}
+
+#[derive(Deserialize)]
+struct GqlLabels {
+    nodes: Vec<GqlLabel>,
+}
+
+#[derive(Deserialize)]
+struct GqlLabel {
+    name: String,
+    color: String,
+}
+
+#[derive(Deserialize)]
+struct GqlCommits {
+    nodes: Vec<GqlCommitNode>,
+}
+
+#[derive(Deserialize)]
+struct GqlCommitNode {
+    commit: GqlCommit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlCommit {
+    status_check_rollup: Option<GqlRollup>,
+}
+
+#[derive(Deserialize)]
+struct GqlRollup {
+    state: String,
+}
+
+fn map_check_rollup(state: &str) -> CheckRollup {
+    match state {
+        "SUCCESS" => CheckRollup::Success,
+        "FAILURE" | "ERROR" => CheckRollup::Failure,
+        _ => CheckRollup::Pending,
+    }
 }
 
 fn map_graphql_state(state: &str) -> PullRequestState {
@@ -286,6 +357,29 @@ fn map_graphql_pr(pr: GqlPullRequest) -> PullRequestInfo {
         updated_at: pr.updated_at.into(),
         review_status: map_review_decision(pr.review_decision.as_deref()),
         is_draft: pr.is_draft,
+        mergeable: match pr.mergeable.as_deref() {
+            Some("MERGEABLE") => Some(true),
+            Some("CONFLICTING") => Some(false),
+            _ => None,
+        },
+        checks: pr
+            .commits
+            .and_then(|commits| commits.nodes.into_iter().next())
+            .and_then(|node| node.commit.status_check_rollup)
+            .map(|rollup| map_check_rollup(&rollup.state)),
+        labels: pr
+            .labels
+            .map(|labels| {
+                labels
+                    .nodes
+                    .into_iter()
+                    .map(|label| PrLabel {
+                        name: label.name.into(),
+                        color: label.color.into(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -330,6 +424,9 @@ impl ReviewProvider for GitHubProvider {
                      number title state createdAt updatedAt isDraft \
                      baseRefName headRefName baseRefOid headRefOid \
                      author {{ login }} reviewDecision \
+                     mergeable \
+                     labels(first: 10) {{ nodes {{ name color }} }} \
+                     commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} \
                    }} \
                  }} \
                }} \
@@ -413,6 +510,81 @@ impl ReviewProvider for GitHubProvider {
         Box::pin(async move {
             let gh_pr: GhPullRequest = github_get(&http_client, &token, &url).await?;
             Ok(gh_pr.body.unwrap_or_default())
+        })
+    }
+
+    fn fetch_pull_request_status(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u32,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<PullRequestStatus>> + Send>> {
+        let query = "query($owner: String!, $repo: String!, $number: Int!) { \
+               repository(owner: $owner, name: $repo) { \
+                 pullRequest(number: $number) { \
+                   mergeable \
+                   labels(first: 20) { nodes { name color } } \
+                   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } \
+                 } \
+               } \
+             }";
+        let owner = owner.to_string();
+        let repo = repo.to_string();
+        let url = format!("{GITHUB_API_URL}/graphql");
+        let http_client = self.http_client.clone();
+        let token = self.token.clone();
+
+        Box::pin(async move {
+            let body = serde_json::json!({
+                "query": query,
+                "variables": { "owner": owner, "repo": repo, "number": number },
+            })
+            .to_string();
+            let response: PrStatusResponse = github_post(&http_client, &token, &url, body).await?;
+            if !response.errors.is_empty() {
+                let message = response
+                    .errors
+                    .into_iter()
+                    .map(|error| error.message)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                bail!("GitHub GraphQL error: {message}");
+            }
+            let Some(pr) = response
+                .data
+                .and_then(|data| data.repository)
+                .and_then(|repository| repository.pull_request)
+            else {
+                return Ok(PullRequestStatus::default());
+            };
+            let mergeable = match pr.mergeable.as_deref() {
+                Some("MERGEABLE") => Some(true),
+                Some("CONFLICTING") => Some(false),
+                _ => None,
+            };
+            let checks = pr
+                .commits
+                .and_then(|commits| commits.nodes.into_iter().next())
+                .and_then(|node| node.commit.status_check_rollup)
+                .map(|rollup| map_check_rollup(&rollup.state));
+            let labels = pr
+                .labels
+                .map(|labels| {
+                    labels
+                        .nodes
+                        .into_iter()
+                        .map(|label| PrLabel {
+                            name: label.name.into(),
+                            color: label.color.into(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(PullRequestStatus {
+                mergeable,
+                checks,
+                labels,
+            })
         })
     }
 

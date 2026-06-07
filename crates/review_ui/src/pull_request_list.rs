@@ -1,4 +1,6 @@
-use crate::review_provider::{PullRequestInfo, PullRequestState, ReviewProvider};
+use crate::review_provider::{
+    CheckRollup, PullRequestInfo, PullRequestState, ReviewProvider, ReviewStatus,
+};
 use editor::{Editor, EditorEvent};
 use gpui::{
     Anchor, AnyElement, Context, Entity, EventEmitter, Render, SharedString,
@@ -259,6 +261,48 @@ impl PullRequestList {
         let author = pr.author.clone();
         let updated = pr.updated_at.clone();
         let is_draft = pr.is_draft;
+
+        let checks_icon = pr.checks.map(|rollup| {
+            let (icon, color, tip) = match rollup {
+                CheckRollup::Success => (IconName::CheckDouble, Color::Created, "Checks passed"),
+                CheckRollup::Failure => (IconName::XCircle, Color::Error, "Checks failing"),
+                CheckRollup::Pending => (IconName::Circle, Color::Muted, "Checks running"),
+            };
+            div()
+                .id(("pr-checks", number as usize))
+                .tooltip(Tooltip::text(tip))
+                .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+        });
+        let review_icon = match pr.review_status {
+            ReviewStatus::Approved => Some((IconName::ThumbsUp, Color::Created)),
+            ReviewStatus::ChangesRequested => Some((IconName::ThumbsDown, Color::Error)),
+            _ => None,
+        };
+        let conflicts = pr.mergeable == Some(false);
+        let extra_labels = pr.labels.len().saturating_sub(2);
+        let label_pills: Vec<(SharedString, gpui::Hsla)> = pr
+            .labels
+            .iter()
+            .take(2)
+            .map(|l| (l.name.clone(), label_hsla(&l.color)))
+            .collect();
+
+        let status_icons = h_flex()
+            .flex_none()
+            .gap_1()
+            .items_center()
+            .children(checks_icon)
+            .children(
+                review_icon.map(|(icon, color)| Icon::new(icon).size(IconSize::XSmall).color(color)),
+            )
+            .when(conflicts, |row| {
+                row.child(
+                    Icon::new(IconName::GitMergeConflict)
+                        .size(IconSize::XSmall)
+                        .color(Color::Error),
+                )
+            });
+
         h_flex()
             .id(SharedString::from(format!("pr_{}", number)))
             .px_2()
@@ -275,6 +319,7 @@ impl PullRequestList {
             )
             .child(
                 v_flex()
+                    .flex_1()
                     .overflow_x_hidden()
                     .child(
                         h_flex()
@@ -297,6 +342,7 @@ impl PullRequestList {
                                         ),
                                 )
                             })
+                            .child(status_icons)
                             .child(
                                 Label::new(title.to_string())
                                     .size(LabelSize::Small)
@@ -304,10 +350,34 @@ impl PullRequestList {
                             ),
                     )
                     .child(
-                        Label::new(format!("by {} · {}", author, updated))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .single_line(),
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .overflow_x_hidden()
+                            .child(
+                                Label::new(format!("by {} · {}", author, updated))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .single_line(),
+                            )
+                            .children(label_pills.into_iter().map(|(name, color)| {
+                                div()
+                                    .flex_none()
+                                    .px_0p5()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(color)
+                                    .text_size(px(9.0))
+                                    .text_color(color)
+                                    .child(name)
+                            }))
+                            .when(extra_labels > 0, |row| {
+                                row.child(
+                                    Label::new(format!("+{extra_labels}"))
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                            }),
                     ),
             )
             .on_click(cx.listener(move |_this, _event, _window, cx| {
@@ -315,6 +385,14 @@ impl PullRequestList {
             }))
             .into_any_element()
     }
+}
+
+/// Parse a GitHub label hex color (e.g. "1d76db") into an Hsla, falling back to
+/// a neutral gray.
+fn label_hsla(hex: &str) -> gpui::Hsla {
+    u32::from_str_radix(hex.trim_start_matches('#'), 16)
+        .map(|rgb| gpui::rgb(rgb).into())
+        .unwrap_or_else(|_| gpui::rgb(0x8888_88).into())
 }
 
 impl Render for PullRequestList {
