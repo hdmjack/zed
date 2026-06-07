@@ -1,11 +1,11 @@
 use crate::file_list::{FileList, FileListEvent};
 use crate::github_provider::GitHubProvider;
-use crate::inline_comment::{ApplySuggestion, comment_markdown, parse_suggestions, render_pr_comment_block, SuggestionBlock};
+use crate::inline_comment::{ApplySuggestion, ReactToComment, comment_markdown, parse_suggestions, render_pr_comment_block, SuggestionBlock};
 use crate::pull_request_list::{PullRequestList, PullRequestListEvent, RemoteState};
 use crate::review_view::{ReviewView, ReviewViewEvent};
 use crate::github_token::resolve_github_token;
 use crate::review_panel_settings::ReviewPanelSettings;
-use crate::review_provider::{PullRequestInfo, ReviewComment, ReviewProvider};
+use crate::review_provider::{PullRequestInfo, ReactionContent, ReviewComment, ReviewProvider};
 use markdown::Markdown;
 use anyhow::Result;
 use collections::HashMap;
@@ -191,6 +191,16 @@ pub fn register(workspace: &mut Workspace) {
         };
         panel.update(cx, |panel, cx| {
             panel.begin_inline_comment(editor.downgrade(), window, cx);
+        });
+    });
+
+    workspace.register_action(|workspace, action: &ReactToComment, _window, cx| {
+        let Some(panel) = workspace.panel::<ReviewPanel>(cx) else {
+            return;
+        };
+        let action = action.clone();
+        panel.update(cx, |panel, cx| {
+            panel.handle_react_to_comment(action, cx);
         });
     });
 }
@@ -590,6 +600,9 @@ impl ReviewPanel {
                         this.review_view = None;
                         this.remove_all_injected_blocks(cx);
                         this.show_pull_request_list(window, cx);
+                    }
+                    ReviewViewEvent::CommentsChanged => {
+                        this.refresh_inline_comment_blocks(cx);
                     }
                 }
             });
@@ -1187,6 +1200,25 @@ impl ReviewPanel {
         )
     }
 
+    /// Re-render injected inline comment blocks (after reactions load or toggle)
+    /// for whichever diff editor currently has them, deferred out of the click's
+    /// layout pass to avoid an editor resize feedback loop.
+    fn refresh_inline_comment_blocks(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self
+            .injected_comment_blocks
+            .values()
+            .find_map(|(editor, _)| editor.upgrade())
+        else {
+            return;
+        };
+        let weak_self = cx.weak_entity();
+        cx.defer(move |cx| {
+            weak_self
+                .update(cx, |this, cx| this.reinject_inline_blocks(&editor, cx))
+                .ok();
+        });
+    }
+
     fn reinject_inline_blocks(&mut self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
         let Some((review_view, _)) = &self.review_view else {
             return;
@@ -1334,6 +1366,19 @@ impl ReviewPanel {
             }
         }
         total.max(3)
+    }
+
+    fn handle_react_to_comment(&mut self, action: ReactToComment, cx: &mut Context<Self>) {
+        let Some(content) = ReactionContent::from_graphql(&action.content) else {
+            log::warn!("react_to_comment: unknown content {:?}", action.content);
+            return;
+        };
+        let Some((review_view, _)) = &self.review_view else {
+            return;
+        };
+        review_view.update(cx, |review_view, cx| {
+            review_view.toggle_reaction(action.comment_id, content, action.add, cx);
+        });
     }
 
     fn handle_apply_suggestion(

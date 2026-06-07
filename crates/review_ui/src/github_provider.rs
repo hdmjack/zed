@@ -193,6 +193,8 @@ fn map_review_comment(comment: GhReviewComment) -> ReviewComment {
         line: comment.line,
         reply_to: comment.in_reply_to_id,
         diff_hunk: comment.diff_hunk.map(SharedString::from),
+        node_id: SharedString::default(),
+        reactions: Vec::new(),
     }
 }
 
@@ -353,6 +355,87 @@ struct ViewedFileNode {
 struct MutationResponse {
     #[serde(default)]
     errors: Vec<GraphQlError>,
+}
+
+#[derive(Deserialize)]
+struct ReactionsResponse {
+    data: Option<ReactionsData>,
+    #[serde(default)]
+    errors: Vec<GraphQlError>,
+}
+
+#[derive(Deserialize)]
+struct ReactionsData {
+    repository: Option<ReactionsRepo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReactionsRepo {
+    pull_request: Option<ReactionsPr>,
+}
+
+#[derive(Deserialize)]
+struct NodeList<T> {
+    nodes: Vec<T>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReactionsPr {
+    reviews: NodeList<ReactionNode>,
+    comments: NodeList<ReactionNode>,
+    review_threads: NodeList<ReviewThreadNode>,
+}
+
+#[derive(Deserialize)]
+struct ReviewThreadNode {
+    comments: NodeList<ReactionNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReactionNode {
+    database_id: Option<u64>,
+    id: String,
+    #[serde(default)]
+    reaction_groups: Vec<ReactionGroupNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReactionGroupNode {
+    content: String,
+    viewer_has_reacted: bool,
+    reactors: ReactorsCount,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReactorsCount {
+    total_count: u32,
+}
+
+impl ReactionNode {
+    fn into_comment_reactions(self) -> Option<CommentReactions> {
+        let database_id = self.database_id?;
+        let reactions = self
+            .reaction_groups
+            .into_iter()
+            .filter_map(|group| {
+                Some(ReactionGroup {
+                    content: ReactionContent::from_graphql(&group.content)?,
+                    count: group.reactors.total_count,
+                    viewer_reacted: group.viewer_has_reacted,
+                })
+            })
+            .collect();
+        Some(CommentReactions {
+            database_id,
+            node_id: self.id.into(),
+            reactions,
+        })
+    }
 }
 
 fn map_check_rollup(state: &str) -> CheckRollup {
@@ -638,6 +721,108 @@ impl ReviewProvider for GitHubProvider {
         })
     }
 
+    fn fetch_comment_reactions(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u32,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<CommentReactions>>> + Send>> {
+        let groups = "reactionGroups { content viewerHasReacted reactors { totalCount } }";
+        let query = format!(
+            "query($owner: String!, $repo: String!, $number: Int!) {{ \
+               repository(owner: $owner, name: $repo) {{ \
+                 pullRequest(number: $number) {{ \
+                   reviews(first: 100) {{ nodes {{ databaseId id {groups} }} }} \
+                   comments(first: 100) {{ nodes {{ databaseId id {groups} }} }} \
+                   reviewThreads(first: 100) {{ nodes {{ comments(first: 50) {{ nodes {{ databaseId id {groups} }} }} }} }} \
+                 }} \
+               }} \
+             }}"
+        );
+        let owner = owner.to_string();
+        let repo = repo.to_string();
+        let url = format!("{GITHUB_API_URL}/graphql");
+        let http_client = self.http_client.clone();
+        let token = self.token.clone();
+
+        Box::pin(async move {
+            let body = serde_json::json!({
+                "query": query,
+                "variables": { "owner": owner, "repo": repo, "number": number },
+            })
+            .to_string();
+            let response: ReactionsResponse = github_post(&http_client, &token, &url, body).await?;
+            if !response.errors.is_empty() {
+                let message = response
+                    .errors
+                    .into_iter()
+                    .map(|error| error.message)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                bail!("GitHub GraphQL error: {message}");
+            }
+            let Some(pr) = response
+                .data
+                .and_then(|data| data.repository)
+                .and_then(|repo| repo.pull_request)
+            else {
+                return Ok(Vec::new());
+            };
+            let reactions = pr
+                .reviews
+                .nodes
+                .into_iter()
+                .chain(pr.comments.nodes)
+                .chain(
+                    pr.review_threads
+                        .nodes
+                        .into_iter()
+                        .flat_map(|thread| thread.comments.nodes),
+                )
+                .filter_map(ReactionNode::into_comment_reactions)
+                .collect();
+            Ok(reactions)
+        })
+    }
+
+    fn set_reaction(
+        &self,
+        comment_node_id: &str,
+        content: ReactionContent,
+        add: bool,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+        let mutation = if add { "addReaction" } else { "removeReaction" };
+        let query = format!(
+            "mutation($id: ID!, $content: ReactionContent!) {{ \
+               {mutation}(input: {{ subjectId: $id, content: $content }}) {{ clientMutationId }} \
+             }}"
+        );
+        let id = comment_node_id.to_string();
+        let content = content.graphql();
+        let url = format!("{GITHUB_API_URL}/graphql");
+        let http_client = self.http_client.clone();
+        let token = self.token.clone();
+
+        Box::pin(async move {
+            let body = serde_json::json!({
+                "query": query,
+                "variables": { "id": id, "content": content },
+            })
+            .to_string();
+            let response: MutationResponse = github_post(&http_client, &token, &url, body).await?;
+            if !response.errors.is_empty() {
+                let message = response
+                    .errors
+                    .into_iter()
+                    .map(|error| error.message)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                bail!("GitHub GraphQL error: {message}");
+            }
+            Ok(())
+        })
+    }
+
     fn fetch_pull_request_status(
         &self,
         owner: &str,
@@ -774,6 +959,8 @@ impl ReviewProvider for GitHubProvider {
                     line: None,
                     reply_to: None,
                     diff_hunk: None,
+                    node_id: SharedString::default(),
+                    reactions: Vec::new(),
                 });
             }
 
@@ -790,6 +977,8 @@ impl ReviewProvider for GitHubProvider {
                             line: None,
                             reply_to: None,
                             diff_hunk: None,
+                            node_id: SharedString::default(),
+                            reactions: Vec::new(),
                         });
                     }
                 }
@@ -826,6 +1015,8 @@ impl ReviewProvider for GitHubProvider {
                 line,
                 reply_to: None,
                 diff_hunk: None,
+                node_id: SharedString::default(),
+                reactions: Vec::new(),
             })
         })
     }

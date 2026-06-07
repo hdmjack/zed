@@ -1,8 +1,9 @@
 use crate::comment_card::{CommentCard, CommentPreview};
 use crate::file_list::{DisplayEntry, ViewMode, build_file_tree, flatten_file_tree};
 use crate::review_provider::{
-    CheckRollup, FileChangeStatus, PullRequestFile, PullRequestInfo, PullRequestState,
-    PullRequestStatus, ReviewComment, ReviewProvider, ReviewStatus,
+    CheckRollup, CommentReactions, FileChangeStatus, PullRequestFile, PullRequestInfo,
+    PullRequestState, PullRequestStatus, ReactionContent, ReactionGroup, ReviewComment,
+    ReviewProvider, ReviewStatus,
 };
 use collections::{HashMap, HashSet};
 use editor::Editor;
@@ -23,6 +24,29 @@ use ui::{
 pub enum ReviewViewEvent {
     OpenFileDiff(RepoPath),
     Back,
+    /// Loaded comment data changed (reactions merged/toggled); any injected
+    /// inline comment blocks should be re-rendered.
+    CommentsChanged,
+}
+
+/// Apply a single reaction add/remove to a comment's tally in place, keeping
+/// the `viewer_reacted` flag and count consistent (used for optimistic UI).
+fn apply_reaction_delta(reactions: &mut Vec<ReactionGroup>, content: ReactionContent, add: bool) {
+    if let Some(group) = reactions.iter_mut().find(|g| g.content == content) {
+        if add && !group.viewer_reacted {
+            group.viewer_reacted = true;
+            group.count += 1;
+        } else if !add && group.viewer_reacted {
+            group.viewer_reacted = false;
+            group.count = group.count.saturating_sub(1);
+        }
+    } else if add {
+        reactions.push(ReactionGroup {
+            content,
+            count: 1,
+            viewer_reacted: true,
+        });
+    }
 }
 
 const TREE_INDENT: f32 = 16.0;
@@ -800,9 +824,82 @@ impl ReviewView {
             this.update(cx, |this, cx| {
                 this.set_pr_comments(comments, cx);
             })?;
+            // Reactions need a separate GraphQL round-trip; fold them in once the
+            // comments are already on screen rather than blocking the first paint.
+            let reactions = provider
+                .fetch_comment_reactions(&owner, &repo, pr_number)
+                .await?;
+            this.update(cx, |this, cx| {
+                this.merge_reactions(reactions, cx);
+            })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    /// Fold reaction tallies (and the GraphQL node ids needed to mutate them)
+    /// into the already-loaded comments, keyed by numeric comment id.
+    fn merge_reactions(&mut self, reactions: Vec<CommentReactions>, cx: &mut Context<Self>) {
+        let by_id: HashMap<u64, CommentReactions> = reactions
+            .into_iter()
+            .map(|reaction| (reaction.database_id, reaction))
+            .collect();
+        for comment in &mut self.pr_comments {
+            if let Some(reaction) = by_id.get(&comment.id) {
+                comment.node_id = reaction.node_id.clone();
+                comment.reactions = reaction.reactions.clone();
+            }
+        }
+        self.rebuild(cx);
+        cx.emit(ReviewViewEvent::CommentsChanged);
+        cx.notify();
+    }
+
+    /// Add or remove the current user's reaction on a comment, updating the
+    /// local tally optimistically and reverting on failure.
+    pub fn toggle_reaction(
+        &mut self,
+        comment_id: u64,
+        content: ReactionContent,
+        add: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(provider) = self.provider.clone() else {
+            return;
+        };
+        let Some(comment) = self.pr_comments.iter_mut().find(|c| c.id == comment_id) else {
+            return;
+        };
+        let node_id = comment.node_id.clone();
+        if node_id.is_empty() {
+            log::warn!("toggle_reaction: comment {comment_id} has no node id yet");
+            return;
+        }
+        apply_reaction_delta(&mut comment.reactions, content, add);
+        self.rebuild(cx);
+        cx.emit(ReviewViewEvent::CommentsChanged);
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = provider.set_reaction(&node_id, content, add).await {
+                log::error!("failed to set reaction: {error:#}");
+                this.update(cx, |this, cx| {
+                    if let Some(comment) = this.pr_comments.iter_mut().find(|c| c.id == comment_id) {
+                        // Revert the optimistic toggle.
+                        apply_reaction_delta(&mut comment.reactions, content, !add);
+                        this.rebuild(cx);
+                        this.emit_comments_changed(cx);
+                        cx.notify();
+                    }
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn emit_comments_changed(&mut self, cx: &mut Context<Self>) {
+        cx.emit(ReviewViewEvent::CommentsChanged);
     }
 
     fn load_pr_api_files(&mut self, pr_number: u32, cx: &mut Context<Self>) {

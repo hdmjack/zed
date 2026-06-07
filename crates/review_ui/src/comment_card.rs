@@ -153,6 +153,10 @@ impl RenderOnce for CommentCard {
                 .child(MarkdownElement::new(self.body, markdown_style)),
         );
 
+        if let Some(bar) = crate::inline_comment::reaction_bar(&self.comment, "card", cx) {
+            card = card.child(bar);
+        }
+
         card
     }
 }

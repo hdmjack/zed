@@ -1,10 +1,10 @@
-use crate::review_provider::ReviewComment;
+use crate::review_provider::{ReactionContent, ReviewComment};
 use editor::display_map::BlockContext;
 use gpui::{AnyElement, App, Entity, SharedString};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
 use ui::{
-    Button, ButtonStyle, Color, FluentBuilder, IconName, IntoElement, Label, LabelSize, h_flex,
-    prelude::*, v_flex,
+    Button, ButtonStyle, Color, ContextMenu, FluentBuilder, IconName, IntoElement, Label,
+    LabelSize, PopoverMenu, div, h_flex, prelude::*, v_flex,
 };
 
 #[derive(Clone, Debug)]
@@ -143,6 +143,10 @@ pub fn render_pr_comment_block(
             row = row.child(render_suggestion_block(suggestion, comment.id, cx));
         }
 
+        if let Some(bar) = reaction_bar(comment, "inline", cx.app) {
+            row = row.child(bar);
+        }
+
         container = container.child(row);
     }
 
@@ -211,4 +215,116 @@ fn render_suggestion_block(
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
 pub struct ApplySuggestion {
     pub comment_id: u64,
+}
+
+/// Dispatched (from either the sidebar card or an inline block) to add or remove
+/// the current user's reaction on a comment. `content` is the GraphQL
+/// `ReactionContent` value (e.g. `THUMBS_UP`).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+pub struct ReactToComment {
+    pub comment_id: u64,
+    pub content: String,
+    pub add: bool,
+}
+
+/// A row of reaction pills (one per non-zero reaction) plus a "+" picker, shared
+/// by the sidebar comment card and the inline diff comment block. Both surfaces
+/// drive reactions by dispatching `ReactToComment`, so this needs no entity
+/// handle. Returns `None` for comments without a node id (e.g. a just-posted
+/// comment that hasn't been reloaded), which can't be reacted to yet.
+pub fn reaction_bar(comment: &ReviewComment, surface: &str, cx: &mut App) -> Option<AnyElement> {
+    if comment.node_id.is_empty() {
+        return None;
+    }
+    let comment_id = comment.id;
+    let colors = cx.theme().colors().clone();
+
+    let mut bar = h_flex().flex_wrap().gap_1().items_center();
+    for group in &comment.reactions {
+        if group.count == 0 {
+            continue;
+        }
+        let content = group.content;
+        let add = !group.viewer_reacted;
+        let (background, border) = if group.viewer_reacted {
+            (colors.element_selected, colors.border_focused)
+        } else {
+            (colors.element_background, colors.border)
+        };
+        bar = bar.child(
+            div()
+                .id(SharedString::from(format!(
+                    "reaction-{surface}-{comment_id}-{}",
+                    content.graphql()
+                )))
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .px_1()
+                .rounded_md()
+                .border_1()
+                .border_color(border)
+                .bg(background)
+                .cursor_pointer()
+                .hover(|style| style.border_color(colors.border_focused))
+                .child(Label::new(content.emoji()).size(LabelSize::XSmall))
+                .child(
+                    Label::new(group.count.to_string())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .on_click(move |_event, window, cx| {
+                    window.dispatch_action(
+                        Box::new(ReactToComment {
+                            comment_id,
+                            content: content.graphql().to_string(),
+                            add,
+                        }),
+                        cx,
+                    );
+                }),
+        );
+    }
+
+    let reactions = comment.reactions.clone();
+    let picker = PopoverMenu::new(SharedString::from(format!(
+        "react-picker-{surface}-{comment_id}"
+    )))
+        .trigger(
+            Button::new(
+                SharedString::from(format!("react-add-{surface}-{comment_id}")),
+                "Add reaction",
+            )
+            .label_size(LabelSize::Small)
+            .color(Color::Muted)
+            .style(ButtonStyle::Subtle),
+        )
+        .menu(move |window, cx| {
+            let reactions = reactions.clone();
+            Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                for content in ReactionContent::ALL {
+                    let already = reactions
+                        .iter()
+                        .any(|group| group.content == content && group.viewer_reacted);
+                    let add = !already;
+                    menu = menu.entry(
+                        format!("{}  {}", content.emoji(), content.label()),
+                        None,
+                        move |window, cx| {
+                            window.dispatch_action(
+                                Box::new(ReactToComment {
+                                    comment_id,
+                                    content: content.graphql().to_string(),
+                                    add,
+                                }),
+                                cx,
+                            );
+                        },
+                    );
+                }
+                menu
+            }))
+        });
+
+    Some(bar.child(picker).into_any_element())
 }

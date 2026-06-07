@@ -47,6 +47,9 @@ pub struct PullRequestFile {
 #[derive(Clone, Debug)]
 pub struct ReviewComment {
     pub id: u64,
+    /// GraphQL global node id of this comment, needed for reaction mutations.
+    /// Empty until reactions are merged in (e.g. for a freshly-posted comment).
+    pub node_id: SharedString,
     pub author: SharedString,
     pub body: SharedString,
     pub created_at: SharedString,
@@ -54,6 +57,105 @@ pub struct ReviewComment {
     pub line: Option<u32>,
     pub reply_to: Option<u64>,
     pub diff_hunk: Option<SharedString>,
+    /// Emoji reaction tallies for this comment (only contents with count > 0 are
+    /// worth displaying; the full set is kept so the picker knows current state).
+    pub reactions: Vec<ReactionGroup>,
+}
+
+/// The eight reaction contents GitHub supports, in display order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReactionContent {
+    ThumbsUp,
+    ThumbsDown,
+    Laugh,
+    Hooray,
+    Confused,
+    Heart,
+    Rocket,
+    Eyes,
+}
+
+impl ReactionContent {
+    pub const ALL: [ReactionContent; 8] = [
+        ReactionContent::ThumbsUp,
+        ReactionContent::ThumbsDown,
+        ReactionContent::Laugh,
+        ReactionContent::Hooray,
+        ReactionContent::Confused,
+        ReactionContent::Heart,
+        ReactionContent::Rocket,
+        ReactionContent::Eyes,
+    ];
+
+    /// The GraphQL `ReactionContent` enum value (also used in mutation inputs).
+    pub fn graphql(self) -> &'static str {
+        match self {
+            ReactionContent::ThumbsUp => "THUMBS_UP",
+            ReactionContent::ThumbsDown => "THUMBS_DOWN",
+            ReactionContent::Laugh => "LAUGH",
+            ReactionContent::Hooray => "HOORAY",
+            ReactionContent::Confused => "CONFUSED",
+            ReactionContent::Heart => "HEART",
+            ReactionContent::Rocket => "ROCKET",
+            ReactionContent::Eyes => "EYES",
+        }
+    }
+
+    pub fn from_graphql(value: &str) -> Option<Self> {
+        Some(match value {
+            "THUMBS_UP" => ReactionContent::ThumbsUp,
+            "THUMBS_DOWN" => ReactionContent::ThumbsDown,
+            "LAUGH" => ReactionContent::Laugh,
+            "HOORAY" => ReactionContent::Hooray,
+            "CONFUSED" => ReactionContent::Confused,
+            "HEART" => ReactionContent::Heart,
+            "ROCKET" => ReactionContent::Rocket,
+            "EYES" => ReactionContent::Eyes,
+            _ => return None,
+        })
+    }
+
+    pub fn emoji(self) -> &'static str {
+        match self {
+            ReactionContent::ThumbsUp => "👍",
+            ReactionContent::ThumbsDown => "👎",
+            ReactionContent::Laugh => "😄",
+            ReactionContent::Hooray => "🎉",
+            ReactionContent::Confused => "😕",
+            ReactionContent::Heart => "❤️",
+            ReactionContent::Rocket => "🚀",
+            ReactionContent::Eyes => "👀",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ReactionContent::ThumbsUp => "Thumbs up",
+            ReactionContent::ThumbsDown => "Thumbs down",
+            ReactionContent::Laugh => "Laugh",
+            ReactionContent::Hooray => "Hooray",
+            ReactionContent::Confused => "Confused",
+            ReactionContent::Heart => "Heart",
+            ReactionContent::Rocket => "Rocket",
+            ReactionContent::Eyes => "Eyes",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ReactionGroup {
+    pub content: ReactionContent,
+    pub count: u32,
+    pub viewer_reacted: bool,
+}
+
+/// Reaction state for a single comment, keyed back to the REST comment by its
+/// numeric `database_id` (matches `ReviewComment::id`).
+#[derive(Clone, Debug)]
+pub struct CommentReactions {
+    pub database_id: u64,
+    pub node_id: SharedString,
+    pub reactions: Vec<ReactionGroup>,
 }
 
 #[derive(Clone, Debug)]
@@ -230,12 +332,24 @@ pub trait ReviewProvider: Send + Sync {
         body: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
 
-    fn react_to_comment(
+    /// Fetch the reaction tallies for every comment on a PR, keyed by the
+    /// comment's numeric `database_id`.
+    fn fetch_comment_reactions(
         &self,
         _owner: &str,
         _repo: &str,
-        _comment_id: u64,
-        _reaction: &str,
+        _number: u32,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<CommentReactions>>> + Send>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Add or remove the current user's reaction of `content` on the comment
+    /// identified by its GraphQL node id.
+    fn set_reaction(
+        &self,
+        _comment_node_id: &str,
+        _content: ReactionContent,
+        _add: bool,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
         Box::pin(async { Err(anyhow::anyhow!("reactions not supported by this provider")) })
     }
