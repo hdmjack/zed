@@ -1,8 +1,9 @@
 use crate::comment_card::{CommentCard, CommentPreview};
 use crate::file_list::{DisplayEntry, ViewMode, build_file_tree, flatten_file_tree};
 use crate::review_provider::{
-    CheckRollup, CommentReactions, FileChangeStatus, PullRequestFile, PullRequestInfo,
-    PullRequestStatus, ReactionContent, ReactionGroup, ReviewComment, ReviewProvider, ReviewStatus,
+    CheckRollup, CommentReactions, FileChangeStatus, MergeMethod, PullRequestFile,
+    PullRequestInfo, PullRequestStatus, ReactionContent, ReactionGroup, ReviewComment,
+    ReviewProvider, ReviewStatus,
 };
 use collections::{HashMap, HashSet};
 use editor::Editor;
@@ -26,6 +27,8 @@ pub enum ReviewViewEvent {
     /// Loaded comment data changed (reactions merged/toggled); any injected
     /// inline comment blocks should be re-rendered.
     CommentsChanged,
+    /// The PR was merged; the list should refresh so it drops from the open filter.
+    Merged,
 }
 
 /// Apply a single reaction add/remove to a comment's tally in place, keeping
@@ -77,6 +80,11 @@ pub struct ReviewView {
     reply_submitting: bool,
     review_action: ReviewStatus,
     review_action_menu_handle: PopoverMenuHandle<ContextMenu>,
+    merge_method: MergeMethod,
+    merge_menu_handle: PopoverMenuHandle<ContextMenu>,
+    merging: bool,
+    merged: bool,
+    merge_error: Option<SharedString>,
     view_mode: ViewMode,
     expanded_dirs: HashSet<SharedString>,
     display_entries: Vec<DisplayEntry>,
@@ -232,6 +240,11 @@ impl ReviewView {
             reply_submitting: false,
             review_action: ReviewStatus::Commented,
             review_action_menu_handle: PopoverMenuHandle::default(),
+            merge_method: MergeMethod::Merge,
+            merge_menu_handle: PopoverMenuHandle::default(),
+            merging: false,
+            merged: false,
+            merge_error: None,
             view_mode: ViewMode::Flat,
             expanded_dirs: HashSet::default(),
             display_entries: Vec::new(),
@@ -1023,6 +1036,135 @@ impl ReviewView {
         }
     }
 
+    fn merge_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.merging || self.merged {
+            return;
+        }
+        let (Some(provider), Some(owner), Some(repo)) = (
+            self.provider.clone(),
+            self.remote_owner.clone(),
+            self.remote_repo.clone(),
+        ) else {
+            return;
+        };
+        let number = self.selected_pr.number;
+        let method = self.merge_method;
+        self.merging = true;
+        self.merge_error = None;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let result = provider
+                .merge_pull_request(&owner, &repo, number, method)
+                .await;
+            this.update_in(cx, |this, _window, cx| {
+                this.merging = false;
+                match result {
+                    Ok(()) => {
+                        this.merged = true;
+                        cx.emit(ReviewViewEvent::Merged);
+                    }
+                    Err(error) => {
+                        log::error!("failed to merge pull request: {error:#}");
+                        this.merge_error = Some(SharedString::from(error.to_string()));
+                    }
+                }
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn render_merge_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Reason the PR can't be merged right now (also the disabled tooltip).
+        let reason: Option<SharedString> = if self.merging {
+            None
+        } else if let Some(error) = &self.merge_error {
+            Some(error.clone())
+        } else if matches!(self.selected_pr.review_status, ReviewStatus::ChangesRequested) {
+            Some("Changes have been requested".into())
+        } else if !matches!(self.selected_pr.review_status, ReviewStatus::Approved) {
+            Some("Required approvals are pending".into())
+        } else if self.status.as_ref().and_then(|s| s.mergeable) != Some(true) {
+            Some("This branch has conflicts or pending checks".into())
+        } else {
+            None
+        };
+        let disabled = self.merging || reason.is_some();
+        let label = if self.merging {
+            "Merging…"
+        } else {
+            "Merge pull request"
+        };
+        SplitButton::new(
+            ButtonLike::new_rounded_left("merge-left")
+                .layer(ElevationIndex::ModalSurface)
+                .size(ButtonSize::Compact)
+                .disabled(disabled)
+                .when_some(reason, |button, reason| {
+                    button.tooltip(Tooltip::text(reason))
+                })
+                .child(
+                    Label::new(label).size(LabelSize::Small).color(if disabled {
+                        Color::Disabled
+                    } else {
+                        Color::Default
+                    }),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.merge_pull_request(window, cx);
+                })),
+            self.render_merge_menu(cx).into_any_element(),
+        )
+    }
+
+    fn render_merge_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let weak_view = cx.weak_entity();
+        let current = self.merge_method;
+        PopoverMenu::new("merge-method-menu")
+            .trigger(
+                ButtonLike::new_rounded_right("merge-method-trigger")
+                    .layer(ElevationIndex::ModalSurface)
+                    .size(ButtonSize::None)
+                    .disabled(self.merging)
+                    .child(
+                        h_flex()
+                            .px_1()
+                            .h_full()
+                            .justify_center()
+                            .border_l_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                    ),
+            )
+            .with_handle(self.merge_menu_handle.clone())
+            .anchor(Anchor::TopRight)
+            .menu(move |window, cx| {
+                let weak_view = weak_view.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                    for method in [MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase] {
+                        let weak_view = weak_view.clone();
+                        menu = menu.toggleable_entry(
+                            method.label(),
+                            current == method,
+                            IconPosition::Start,
+                            None,
+                            move |_window, cx| {
+                                weak_view
+                                    .update(cx, |this, cx| {
+                                        this.merge_method = method;
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
+    }
+
     fn submit_reply(&mut self, parent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(provider) = self.provider.clone() else {
             return;
@@ -1746,7 +1888,18 @@ impl Render for ReviewView {
                             .px_2()
                             .py_1()
                             .justify_end()
-                            .child(self.render_review_action_button(cx)),
+                            .gap_2()
+                            .child(self.render_review_action_button(cx))
+                            .when(self.merged, |row| {
+                                row.child(
+                                    Label::new("Merged")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Accent),
+                                )
+                            })
+                            .when(!self.merged, |row| {
+                                row.child(self.render_merge_button(cx))
+                            }),
                     ),
             )
     }

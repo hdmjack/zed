@@ -189,6 +189,23 @@ pub struct PullRequestDetails {
     pub info: PullRequestInfo,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+impl MergeMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            MergeMethod::Merge => "Create a merge commit",
+            MergeMethod::Squash => "Squash and merge",
+            MergeMethod::Rebase => "Rebase and merge",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PullRequestInfo {
     pub number: u32,
@@ -335,6 +352,17 @@ pub trait ReviewProvider: Send + Sync {
         &self,
         pr_node_id: &str,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send>>;
+
+    /// Merge the pull request using the given method.
+    fn merge_pull_request(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _number: u32,
+        _merge_method: MergeMethod,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+        Box::pin(async { Err(anyhow::anyhow!("merge not supported by this provider")) })
+    }
 
     /// Mark/unmark a file as viewed on the PR identified by its GraphQL node id.
     fn mark_file_viewed(

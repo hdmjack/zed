@@ -745,6 +745,9 @@ impl ReviewPanel {
                     ReviewViewEvent::CommentsChanged => {
                         this.refresh_inline_comment_blocks(cx);
                     }
+                    ReviewViewEvent::Merged => {
+                        this.refresh_pull_requests(cx);
+                    }
                 }
             });
         self.review_view = Some((review_view, subscription));

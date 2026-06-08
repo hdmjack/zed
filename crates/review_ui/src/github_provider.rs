@@ -638,6 +638,54 @@ impl ReviewProvider for GitHubProvider {
         })
     }
 
+    fn merge_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u32,
+        merge_method: MergeMethod,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
+        let method = match merge_method {
+            MergeMethod::Merge => "merge",
+            MergeMethod::Squash => "squash",
+            MergeMethod::Rebase => "rebase",
+        };
+        let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/merge");
+        let json = serde_json::json!({ "merge_method": method }).to_string();
+        let http_client = self.http_client.clone();
+        let token = self.token.clone();
+
+        Box::pin(async move {
+            let mut builder = Request::builder()
+                .method(http_client::Method::PUT)
+                .uri(&url)
+                .header("Accept", "application/vnd.github.v3+json")
+                .header("Content-Type", "application/json")
+                .follow_redirects(RedirectPolicy::FollowAll);
+
+            if let Some(token) = &token {
+                builder = builder.header("Authorization", format!("Bearer {}", token));
+            }
+
+            let request = builder.body(AsyncBody::from(json))?;
+            let mut response = http_client.send(request).await?;
+
+            let mut body = Vec::new();
+            response.body_mut().read_to_end(&mut body).await?;
+
+            if !response.status().is_success() {
+                // Surface GitHub's human-readable reason (e.g. "At least 2
+                // approving reviews are required") rather than the raw JSON.
+                let message = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| value["message"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| String::from_utf8_lossy(&body).into_owned());
+                bail!("{message}");
+            }
+            Ok(())
+        })
+    }
+
     fn fetch_viewed_files(
         &self,
         pr_node_id: &str,
