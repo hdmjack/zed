@@ -32,13 +32,26 @@ use ui::{
     IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, Tab, ToggleState,
     Tooltip, h_flex, prelude::*, v_flex,
 };
+use db::kvp::KeyValueStore;
+use serde::{Deserialize, Serialize};
+use util::ResultExt as _;
 use workspace::{
-    Workspace,
+    SERIALIZATION_THROTTLE_TIME, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 use zed_actions::review_panel::{AddComment, ToggleFocus};
 
 const REVIEW_PANEL_KEY: &str = "ReviewPanel";
+
+/// Persisted review state, restored when the workspace reopens. Only the PR's
+/// identity is stored; the rest of `PullRequestInfo` is re-fetched so the head
+/// SHA (used for inline comments) is never stale.
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct SerializedReviewPanel {
+    remote_owner: Option<String>,
+    remote_repo: Option<String>,
+    selected_pr_number: Option<u32>,
+}
 
 #[derive(Clone)]
 struct RecentReview {
@@ -93,6 +106,10 @@ pub struct ReviewPanel {
     inline_composers: Vec<InlineComposer>,
     next_composer_id: usize,
     _workspace_subscription: Option<Subscription>,
+    /// Restored-but-not-yet-applied review state (applied once the provider and
+    /// remote resolve).
+    restore: Option<SerializedReviewPanel>,
+    pending_serialization: gpui::Task<()>,
 }
 
 /// State for an open inline composer (reply to a thread, or a new comment on a
@@ -255,9 +272,10 @@ pub fn register(workspace: &mut Workspace) {
 }
 
 impl ReviewPanel {
-    pub fn new(
+    pub(crate) fn new(
         workspace: &Workspace,
         weak_workspace: WeakEntity<Workspace>,
+        restore: Option<SerializedReviewPanel>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -325,6 +343,8 @@ impl ReviewPanel {
             inline_composers: Vec::new(),
             next_composer_id: 0,
             _workspace_subscription: workspace_subscription,
+            restore,
+            pending_serialization: gpui::Task::ready(()),
         };
         // Create the PR list up front so pull requests start loading in the
         // background as soon as the provider resolves, before the view is opened.
@@ -338,10 +358,65 @@ impl ReviewPanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> Result<Entity<Self>> {
+        let key = workspace
+            .read_with(&cx, |workspace, _| Self::serialization_key(workspace))
+            .ok()
+            .flatten();
+        let serialized = match (key, cx.update(|_, cx| KeyValueStore::global(cx)).ok()) {
+            (Some(key), Some(kvp)) => cx
+                .background_spawn(async move { kvp.read_kvp(&key) })
+                .await
+                .log_err()
+                .flatten()
+                .and_then(|value| serde_json::from_str::<SerializedReviewPanel>(&value).log_err()),
+            _ => None,
+        };
+
         workspace.update_in(&mut cx, |workspace, window, cx| {
             let weak_workspace = workspace.weak_handle();
-            cx.new(|cx| ReviewPanel::new(workspace, weak_workspace, window, cx))
+            cx.new(|cx| ReviewPanel::new(workspace, weak_workspace, serialized, window, cx))
         })
+    }
+
+    fn serialization_key(workspace: &Workspace) -> Option<String> {
+        workspace
+            .database_id()
+            .map(|id| i64::from(id).to_string())
+            .or_else(|| workspace.session_id())
+            .map(|id| format!("{}-{}", REVIEW_PANEL_KEY, id))
+    }
+
+    /// Persist the current review identity (debounced), so reopening the
+    /// workspace resumes the same PR.
+    fn serialize(&mut self, cx: &mut Context<Self>) {
+        let state = SerializedReviewPanel {
+            remote_owner: self.remote_owner.clone(),
+            remote_repo: self.remote_repo.clone(),
+            selected_pr_number: self.selected_pr.as_ref().map(|pr| pr.number),
+        };
+        self.pending_serialization = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(SERIALIZATION_THROTTLE_TIME)
+                .await;
+            let Some((key, kvp)) = this
+                .read_with(cx, |this, cx| {
+                    this._workspace
+                        .read_with(cx, |workspace, _| Self::serialization_key(workspace))
+                        .ok()
+                        .flatten()
+                        .map(|key| (key, KeyValueStore::global(cx)))
+                })
+                .ok()
+                .flatten()
+            else {
+                return;
+            };
+            if let Ok(value) = serde_json::to_string(&state) {
+                cx.background_spawn(async move { kvp.write_kvp(key, value).await })
+                    .await
+                    .log_err();
+            }
+        });
     }
 
     fn set_active_view(&mut self, new_view: ActiveView, cx: &mut Context<Self>) {
@@ -603,6 +678,7 @@ impl ReviewPanel {
                         list.set_provider(provider, owner, repo, cx);
                     });
                 }
+                this.maybe_restore_selected_pr(cx);
                 cx.notify();
             })?;
 
@@ -621,6 +697,40 @@ impl ReviewPanel {
         self.fetch_pr_ref(pr.number, cx);
         self.pending_action = Some(PendingAction::SelectPullRequest(pr.clone()));
         self.set_active_view(ActiveView::ReviewThread, cx);
+        self.serialize(cx);
+    }
+
+    /// Restore the previously-reviewed PR once the provider and remote resolve.
+    /// The PR is re-fetched so its head SHA is current.
+    fn maybe_restore_selected_pr(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.restore.take() else {
+            return;
+        };
+        let (Some(number), Some(provider), Some(owner), Some(repo)) = (
+            state.selected_pr_number,
+            self.provider.clone(),
+            self.remote_owner.clone(),
+            self.remote_repo.clone(),
+        ) else {
+            return;
+        };
+        // Only restore into the same repository the state was saved for.
+        if state.remote_owner.as_deref() != Some(owner.as_str())
+            || state.remote_repo.as_deref() != Some(repo.as_str())
+            || self.selected_pr.is_some()
+        {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let details = provider
+                .fetch_pull_request_details(&owner, &repo, number)
+                .await?;
+            this.update(cx, |this, cx| {
+                this.select_pull_request(&details.info, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn create_review_view(
@@ -875,6 +985,7 @@ impl ReviewPanel {
         }
 
         self.active_view = ActiveView::PullRequestList;
+        self.serialize(cx);
         cx.notify();
     }
 
