@@ -243,9 +243,13 @@ pub fn deploy_context_menu(
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
             });
 
-        ui::ContextMenu::build(window, cx, |menu, _window, _cx| {
-            let builder = menu
-                .on_blur_subscription(Subscription::new(|| {}))
+        ui::ContextMenu::build(window, cx, |menu, window, cx| {
+            let mut builder = menu.on_blur_subscription(Subscription::new(|| {}));
+            // Addon entries are placed at the top of the menu.
+            for addon in editor.addons.values() {
+                builder = addon.extend_mouse_context_menu(builder, window, cx);
+            }
+            let builder = builder
                 .when(run_to_cursor, |builder| {
                     builder.action("Run to Cursor", Box::new(RunToCursor))
                 })

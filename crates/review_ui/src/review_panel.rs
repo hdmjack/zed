@@ -157,6 +157,16 @@ impl Addon for ReviewEditorAddon {
             .into_any_element(),
         )
     }
+
+    fn extend_mouse_context_menu(
+        &self,
+        menu: ContextMenu,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> ContextMenu {
+        menu.action("Add Comment", Box::new(AddComment))
+            .separator()
+    }
 }
 
 pub fn register(workspace: &mut Workspace) {
@@ -862,6 +872,8 @@ impl ReviewPanel {
         };
 
         // Add the per-file "viewed" checkbox to the diff editor's buffer headers.
+        // (The "Add Comment" right-click entry is contributed by the addon's
+        // extend_mouse_context_menu hook.)
         if editor.read(cx).addon::<ReviewEditorAddon>().is_none() {
             let review_view = review_view.downgrade();
             editor.update(cx, |editor, _cx| {

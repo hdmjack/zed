@@ -745,6 +745,18 @@ pub trait Addon: 'static {
         menu
     }
 
+    /// Append entries to the editor's right-click (mouse) context menu. The
+    /// caret has already been moved to the clicked location, so dispatched
+    /// actions that act on the selection target the clicked line.
+    fn extend_mouse_context_menu(
+        &self,
+        menu: ui::ContextMenu,
+        _: &mut Window,
+        _: &mut App,
+    ) -> ui::ContextMenu {
+        menu
+    }
+
     fn override_status_for_buffer_id(&self, _: BufferId, _: &App) -> Option<FileStatus> {
         None
     }
