@@ -2,8 +2,7 @@ use crate::comment_card::{CommentCard, CommentPreview};
 use crate::file_list::{DisplayEntry, ViewMode, build_file_tree, flatten_file_tree};
 use crate::review_provider::{
     CheckRollup, CommentReactions, FileChangeStatus, PullRequestFile, PullRequestInfo,
-    PullRequestState, PullRequestStatus, ReactionContent, ReactionGroup, ReviewComment,
-    ReviewProvider, ReviewStatus,
+    PullRequestStatus, ReactionContent, ReactionGroup, ReviewComment, ReviewProvider, ReviewStatus,
 };
 use collections::{HashMap, HashSet};
 use editor::Editor;
@@ -417,21 +416,56 @@ impl ReviewView {
         let pr = &self.selected_pr;
         let colors = cx.theme().colors().clone();
 
-        let (state_label, state_color) = if pr.is_draft {
-            ("Draft", Color::Muted)
-        } else {
-            match pr.state {
-                PullRequestState::Open => ("Open", Color::Created),
-                PullRequestState::Merged => ("Merged", Color::Accent),
-                PullRequestState::Closed | PullRequestState::All => ("Closed", Color::Error),
+        // Status is conveyed with the same icon vocabulary as the PR list. "Open"
+        // is the default, so only the draft exception is surfaced.
+        let review_icon: Option<(IconName, Color, SharedString)> = match pr.review_status {
+            ReviewStatus::Approved => Some((IconName::ThumbsUp, Color::Created, "Approved".into())),
+            ReviewStatus::ChangesRequested => {
+                Some((IconName::ThumbsDown, Color::Error, "Changes requested".into()))
             }
+            // Has at least one approval but `reviewDecision` is still
+            // REVIEW_REQUIRED — partially approved.
+            ReviewStatus::Pending if pr.approvals > 0 => {
+                let tip = match pr.required_approvals {
+                    Some(required) => format!(
+                        "{} of {} approvals · {} more needed",
+                        pr.approvals,
+                        required,
+                        required.saturating_sub(pr.approvals)
+                    ),
+                    None => format!("{} approval(s) · more required", pr.approvals),
+                };
+                Some((IconName::ThumbsUp, Color::Warning, tip.into()))
+            }
+            ReviewStatus::Pending => {
+                Some((IconName::Person, Color::Muted, "Awaiting review".into()))
+            }
+            ReviewStatus::Commented => None,
         };
-        let review = match pr.review_status {
-            ReviewStatus::Approved => Some(("Approved", Color::Created)),
-            ReviewStatus::ChangesRequested => Some(("Changes requested", Color::Error)),
-            ReviewStatus::Commented => Some(("Commented", Color::Muted)),
-            ReviewStatus::Pending => None,
-        };
+        // Whenever approvals are required, show the running count (e.g. 1/2);
+        // hidden when the branch has no approval requirement.
+        let approval_label = pr
+            .required_approvals
+            .map(|required| SharedString::from(format!("{}/{}", pr.approvals, required)));
+        let merge_icon = self.status.as_ref().and_then(|s| s.mergeable).map(|m| {
+            if m {
+                (IconName::GitBranch, Color::Created, "Mergeable")
+            } else {
+                (IconName::GitMergeConflict, Color::Error, "Merge conflict")
+            }
+        });
+        let checks_icon = self
+            .status
+            .as_ref()
+            .and_then(|s| s.checks)
+            .map(|rollup| match rollup {
+                CheckRollup::Success => (IconName::Check, Color::Created, "Checks passed"),
+                CheckRollup::Failure => (IconName::XCircle, Color::Error, "Checks failing"),
+                CheckRollup::Pending => {
+                    (IconName::TodoProgress, Color::Warning, "Checks running")
+                }
+            });
+
         let pill = |label: &str, color: Color, border: gpui::Hsla, bg: gpui::Hsla| {
             div()
                 .px_1()
@@ -440,6 +474,13 @@ impl ReviewView {
                 .border_color(border)
                 .bg(bg)
                 .child(Label::new(label.to_string()).size(LabelSize::XSmall).color(color))
+        };
+        let number = pr.number;
+        let status_chip = move |suffix: &str, icon: IconName, color: Color, tip: SharedString| {
+            div()
+                .id(SharedString::from(format!("pr-meta-{suffix}-{number}")))
+                .tooltip(Tooltip::text(tip))
+                .child(Icon::new(icon).size(IconSize::XSmall).color(color))
         };
 
         let dates = format!(
@@ -460,30 +501,27 @@ impl ReviewView {
                     .gap_1p5()
                     .items_center()
                     .flex_wrap()
-                    .child(pill(
-                        state_label,
-                        state_color,
-                        colors.border_variant,
-                        colors.element_background,
-                    ))
-                    .children(review.map(|(label, color)| {
-                        pill(label, color, colors.border_variant, colors.element_background)
-                    }))
-                    .children(self.status.as_ref().and_then(|s| s.mergeable).map(|m| {
-                        let (label, color) = if m {
-                            ("Mergeable", Color::Created)
-                        } else {
-                            ("Conflicts", Color::Error)
-                        };
-                        pill(label, color, colors.border_variant, colors.element_background)
-                    }))
-                    .children(self.status.as_ref().and_then(|s| s.checks).map(|rollup| {
-                        let (label, color) = match rollup {
-                            CheckRollup::Success => ("Checks passed", Color::Created),
-                            CheckRollup::Failure => ("Checks failing", Color::Error),
-                            CheckRollup::Pending => ("Checks running", Color::Muted),
-                        };
-                        pill(label, color, colors.border_variant, colors.element_background)
+                    .when(pr.is_draft, |row| {
+                        row.child(status_chip(
+                            "draft",
+                            IconName::Notepad,
+                            Color::Muted,
+                            "Draft".into(),
+                        ))
+                    })
+                    .children(
+                        checks_icon
+                            .map(|(icon, color, tip)| status_chip("checks", icon, color, tip.into())),
+                    )
+                    .children(
+                        merge_icon.map(|(icon, color, tip)| status_chip("merge", icon, color, tip.into())),
+                    )
+                    .children(
+                        review_icon
+                            .map(|(icon, color, tip)| status_chip("review", icon, color, tip)),
+                    )
+                    .children(approval_label.map(|label| {
+                        Label::new(label).size(LabelSize::XSmall).color(Color::Muted)
                     }))
                     .child(
                         Label::new(dates)

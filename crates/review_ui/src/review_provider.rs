@@ -55,6 +55,8 @@ pub struct ReviewComment {
     pub created_at: SharedString,
     pub path: Option<SharedString>,
     pub line: Option<u32>,
+    /// First line of a multi-line comment range (None for single-line comments).
+    pub start_line: Option<u32>,
     pub reply_to: Option<u64>,
     pub diff_hunk: Option<SharedString>,
     /// Emoji reaction tallies for this comment (only contents with count > 0 are
@@ -235,6 +237,11 @@ pub struct PullRequestInfo {
     pub mergeable: Option<bool>,
     pub checks: Option<CheckRollup>,
     pub labels: Vec<PrLabel>,
+    /// Number of distinct approving reviews so far.
+    pub approvals: u32,
+    /// Approvals required by branch protection, if readable (None when there's
+    /// no protection rule or the token can't read it).
+    pub required_approvals: Option<u32>,
 }
 
 pub trait ReviewProvider: Send + Sync {

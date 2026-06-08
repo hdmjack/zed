@@ -55,6 +55,7 @@ struct GhReviewComment {
     created_at: String,
     path: Option<String>,
     line: Option<u32>,
+    start_line: Option<u32>,
     in_reply_to_id: Option<u64>,
     diff_hunk: Option<String>,
 }
@@ -171,6 +172,8 @@ fn map_pull_request(pr: GhPullRequest) -> PullRequestInfo {
         mergeable: None,
         checks: None,
         labels: Vec::new(),
+        approvals: 0,
+        required_approvals: None,
     }
 }
 
@@ -191,6 +194,7 @@ fn map_review_comment(comment: GhReviewComment) -> ReviewComment {
         created_at: comment.created_at.into(),
         path: comment.path.map(SharedString::from),
         line: comment.line,
+        start_line: comment.start_line,
         reply_to: comment.in_reply_to_id,
         diff_hunk: comment.diff_hunk.map(SharedString::from),
         node_id: SharedString::default(),
@@ -258,6 +262,30 @@ struct GqlPullRequest {
     mergeable: Option<String>,
     labels: Option<GqlLabels>,
     commits: Option<GqlCommits>,
+    latest_opinionated_reviews: Option<GqlReviewNodes>,
+    base_ref: Option<GqlBaseRef>,
+}
+
+#[derive(Deserialize)]
+struct GqlReviewNodes {
+    nodes: Vec<GqlReviewState>,
+}
+
+#[derive(Deserialize)]
+struct GqlReviewState {
+    state: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlBaseRef {
+    branch_protection_rule: Option<GqlBranchProtection>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlBranchProtection {
+    required_approving_review_count: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -502,6 +530,20 @@ fn map_graphql_pr(pr: GqlPullRequest) -> PullRequestInfo {
                     .collect()
             })
             .unwrap_or_default(),
+        approvals: pr
+            .latest_opinionated_reviews
+            .map(|reviews| {
+                reviews
+                    .nodes
+                    .iter()
+                    .filter(|review| review.state == "APPROVED")
+                    .count() as u32
+            })
+            .unwrap_or(0),
+        required_approvals: pr
+            .base_ref
+            .and_then(|base_ref| base_ref.branch_protection_rule)
+            .and_then(|rule| rule.required_approving_review_count),
     }
 }
 
@@ -549,6 +591,8 @@ impl ReviewProvider for GitHubProvider {
                      mergeable \
                      labels(first: 10) {{ nodes {{ name color }} }} \
                      commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} \
+                     latestOpinionatedReviews(first: 50) {{ nodes {{ state }} }} \
+                     baseRef {{ branchProtectionRule {{ requiredApprovingReviewCount }} }} \
                    }} \
                  }} \
                }} \
@@ -957,6 +1001,7 @@ impl ReviewProvider for GitHubProvider {
                     created_at: issue_comment.created_at.into(),
                     path: None,
                     line: None,
+                    start_line: None,
                     reply_to: None,
                     diff_hunk: None,
                     node_id: SharedString::default(),
@@ -975,6 +1020,7 @@ impl ReviewProvider for GitHubProvider {
                             created_at: review.submitted_at.unwrap_or_default().into(),
                             path: None,
                             line: None,
+                            start_line: None,
                             reply_to: None,
                             diff_hunk: None,
                             node_id: SharedString::default(),
@@ -1013,6 +1059,7 @@ impl ReviewProvider for GitHubProvider {
                 created_at: gh_comment.created_at.into(),
                 path,
                 line,
+                start_line: None,
                 reply_to: None,
                 diff_hunk: None,
                 node_id: SharedString::default(),

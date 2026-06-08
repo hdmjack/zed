@@ -1414,39 +1414,54 @@ impl ReviewPanel {
             log::warn!("apply_suggestion: comment {} has no line", comment_id);
             return;
         };
+        let Some(path) = comment.path.clone() else {
+            log::warn!("apply_suggestion: comment {} has no path", comment_id);
+            return;
+        };
 
         let Some(editor) = active_editor else {
             log::warn!("apply_suggestion: no active editor");
             return;
         };
 
-        editor.update(cx, |editor, cx| {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
+        // The comment's line numbers are file-relative (the new/RIGHT side). The
+        // active editor may be a multibuffer spanning several files, so resolve
+        // the underlying buffer for `path` and edit it directly rather than in
+        // multibuffer coordinates.
+        let buffers = editor.read(cx).buffer().read(cx).all_buffers();
+        let target_buffer = buffers.into_iter().find(|buffer| {
+            buffer.read(cx).file().is_some_and(|file| {
+                file.path().as_std_path().to_string_lossy() == path.as_ref()
+            })
+        });
+        let Some(target_buffer) = target_buffer else {
+            log::warn!("apply_suggestion: buffer for {path} not open in editor");
+            return;
+        };
+
+        let start_row = comment.start_line.unwrap_or(line).min(line).saturating_sub(1);
+        let end_row = line.saturating_sub(1);
+
+        target_buffer.update(cx, |buffer, cx| {
+            let snapshot = buffer.snapshot();
             let max_row = snapshot.max_point().row;
-            let row = line.saturating_sub(1);
-            if row > max_row {
-                log::warn!(
-                    "apply_suggestion: row {} exceeds buffer max {}",
-                    row,
-                    max_row
-                );
+            if start_row > max_row {
+                log::warn!("apply_suggestion: row {start_row} exceeds buffer max {max_row}");
                 return;
             }
+            let end_row = end_row.min(max_row);
 
-            let line_start = Point::new(row, 0);
-            let line_end = if row < max_row {
-                Point::new(row + 1, 0)
+            let start = Point::new(start_row, 0);
+            // Replace whole lines: extend to the start of the line after the
+            // range so the old lines (and their newlines) are removed, except at
+            // end-of-file where there's no trailing newline to consume.
+            let (end, replacement) = if end_row < max_row {
+                (Point::new(end_row + 1, 0), format!("{}\n", suggestion.suggested_code))
             } else {
-                snapshot.max_point()
+                (snapshot.max_point(), suggestion.suggested_code.clone())
             };
 
-            let replacement = if row < max_row {
-                format!("{}\n", suggestion.suggested_code)
-            } else {
-                suggestion.suggested_code.clone()
-            };
-
-            editor.edit([(line_start..line_end, replacement.as_str())], cx);
+            buffer.edit([(start..end, replacement)], None, cx);
         });
     }
 

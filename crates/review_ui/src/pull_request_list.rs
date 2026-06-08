@@ -264,23 +264,49 @@ impl PullRequestList {
 
         let checks_icon = pr.checks.map(|rollup| {
             let (icon, color, tip) = match rollup {
-                CheckRollup::Success => (IconName::CheckDouble, Color::Created, "Checks passed"),
+                CheckRollup::Success => (IconName::Check, Color::Created, "Checks passed"),
                 CheckRollup::Failure => (IconName::XCircle, Color::Error, "Checks failing"),
-                CheckRollup::Pending => (IconName::Circle, Color::Muted, "Checks running"),
+                CheckRollup::Pending => (IconName::TodoProgress, Color::Warning, "Checks running"),
             };
             div()
                 .id(("pr-checks", number as usize))
                 .tooltip(Tooltip::text(tip))
                 .child(Icon::new(icon).size(IconSize::XSmall).color(color))
         });
-        let review_icon = match pr.review_status {
-            ReviewStatus::Approved => Some((IconName::ThumbsUp, Color::Created, "Approved")),
+        let review_icon: Option<(IconName, Color, SharedString)> = match pr.review_status {
+            ReviewStatus::Approved => Some((IconName::ThumbsUp, Color::Created, "Approved".into())),
             ReviewStatus::ChangesRequested => {
-                Some((IconName::ThumbsDown, Color::Error, "Changes requested"))
+                Some((IconName::ThumbsDown, Color::Error, "Changes requested".into()))
             }
-            _ => None,
+            // Partially approved: at least one approval, but more are required.
+            ReviewStatus::Pending if pr.approvals > 0 => {
+                let tip = match pr.required_approvals {
+                    Some(required) => format!(
+                        "{} of {} approvals · {} more needed",
+                        pr.approvals,
+                        required,
+                        required.saturating_sub(pr.approvals)
+                    ),
+                    None => format!("{} approval(s) · more required", pr.approvals),
+                };
+                Some((IconName::ThumbsUp, Color::Warning, tip.into()))
+            }
+            ReviewStatus::Pending => {
+                Some((IconName::Person, Color::Muted, "Awaiting review".into()))
+            }
+            ReviewStatus::Commented => None,
         };
-        let conflicts = pr.mergeable == Some(false);
+        let merge_icon = pr.mergeable.map(|m| {
+            if m {
+                (IconName::GitBranch, Color::Created, "Mergeable")
+            } else {
+                (IconName::GitMergeConflict, Color::Error, "Merge conflict")
+            }
+        });
+        // Compact approval count, shown whenever approvals are required.
+        let approval_label = pr
+            .required_approvals
+            .map(|required| SharedString::from(format!("{}/{}", pr.approvals, required)));
         let extra_labels = pr.labels.len().saturating_sub(4);
         let label_pills: Vec<(SharedString, gpui::Hsla)> = pr
             .labels
@@ -294,24 +320,22 @@ impl PullRequestList {
             .gap_1()
             .items_center()
             .children(checks_icon)
+            .children(merge_icon.map(|(icon, color, tip)| {
+                div()
+                    .id(("pr-merge", number as usize))
+                    .tooltip(Tooltip::text(tip))
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+            }))
             .children(review_icon.map(|(icon, color, tip)| {
                 div()
                     .id(("pr-review", number as usize))
                     .tooltip(Tooltip::text(tip))
                     .child(Icon::new(icon).size(IconSize::XSmall).color(color))
             }))
-            .when(conflicts, |row| {
-                row.child(
-                    div()
-                        .id(("pr-conflict", number as usize))
-                        .tooltip(Tooltip::text("Merge conflict"))
-                        .child(
-                            Icon::new(IconName::GitMergeConflict)
-                                .size(IconSize::XSmall)
-                                .color(Color::Error),
-                        ),
-                )
-            });
+            .children(
+                approval_label
+                    .map(|label| Label::new(label).size(LabelSize::XSmall).color(Color::Muted)),
+            );
 
         h_flex()
             .id(SharedString::from(format!("pr_{}", number)))
