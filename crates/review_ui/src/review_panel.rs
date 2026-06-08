@@ -119,6 +119,7 @@ enum ComposerTarget {
 /// the PR diff, toggling the same per-file viewed state as the Files panel.
 struct ReviewEditorAddon {
     review_view: WeakEntity<ReviewView>,
+    editor: WeakEntity<Editor>,
 }
 
 impl Addon for ReviewEditorAddon {
@@ -166,6 +167,41 @@ impl Addon for ReviewEditorAddon {
     ) -> ContextMenu {
         menu.action("Add Comment", Box::new(AddComment))
             .separator()
+    }
+
+    fn render_gutter_hover_button(
+        &self,
+        position: editor::Anchor,
+        row: editor::display_map::DisplayRow,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<AnyElement> {
+        // Only on PR diff editors (where the review view is alive).
+        self.review_view.upgrade()?;
+        let editor = self.editor.clone();
+        Some(
+            IconButton::new(("review-add-comment", row.0 as usize), IconName::Plus)
+                .icon_size(IconSize::XSmall)
+                .style(ui::ButtonStyle::Transparent)
+                .tooltip(Tooltip::text("Add comment on this line"))
+                .on_click(move |_event, window, cx| {
+                    let Some(editor) = editor.upgrade() else {
+                        return;
+                    };
+                    // Move the caret to the hovered line so the AddComment
+                    // handler (which reads the selection) targets it.
+                    editor.update(cx, |editor, cx| {
+                        editor.change_selections(
+                            editor::SelectionEffects::no_scroll(),
+                            window,
+                            cx,
+                            |selections| selections.select_anchor_ranges([position..position]),
+                        );
+                    });
+                    window.dispatch_action(Box::new(AddComment), cx);
+                })
+                .into_any_element(),
+        )
     }
 }
 
@@ -876,8 +912,12 @@ impl ReviewPanel {
         // extend_mouse_context_menu hook.)
         if editor.read(cx).addon::<ReviewEditorAddon>().is_none() {
             let review_view = review_view.downgrade();
+            let weak_editor = editor.downgrade();
             editor.update(cx, |editor, _cx| {
-                editor.register_addon(ReviewEditorAddon { review_view });
+                editor.register_addon(ReviewEditorAddon {
+                    review_view,
+                    editor: weak_editor,
+                });
             });
         }
 

@@ -9011,13 +9011,31 @@ impl Element for EditorElement {
                         && !breakpoint_rows.contains_key(&row)
                         && !run_indicator_rows.contains(&row)
                         && !bookmark_rows.contains(&row)
-                        && (show_bookmarks || show_breakpoints)
                     {
                         let position = snapshot
                             .display_point_to_anchor(DisplayPoint::new(row, 0), Bias::Right);
-                        breakpoints.extend(
-                            self.layout_gutter_hover_button(&gutter, position, row, window, cx),
-                        );
+                        // An addon-provided gutter button (e.g. the PR review "+")
+                        // takes precedence over the built-in bookmark/breakpoint
+                        // hover button and shows regardless of those settings.
+                        let addon_button = self.editor.update(cx, |editor, cx| {
+                            let mut button = None;
+                            for addon in editor.addons.values() {
+                                if let Some(element) =
+                                    addon.render_gutter_hover_button(position, row, window, cx)
+                                {
+                                    button = Some(element);
+                                    break;
+                                }
+                            }
+                            button
+                        });
+                        if let Some(button) = addon_button {
+                            breakpoints.push(gutter.prepaint_button(button, row, window, cx));
+                        } else if show_bookmarks || show_breakpoints {
+                            breakpoints.extend(
+                                self.layout_gutter_hover_button(&gutter, position, row, window, cx),
+                            );
+                        }
                     }
 
                     let git_gutter_width = Self::gutter_strip_width(line_height)

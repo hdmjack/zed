@@ -757,6 +757,20 @@ pub trait Addon: 'static {
         menu
     }
 
+    /// Render a button in the gutter of the hovered line (`row`, anchored at
+    /// `position`). Returns `None` to contribute nothing. When an addon returns
+    /// a button it takes precedence over the built-in bookmark/breakpoint hover
+    /// button on that row.
+    fn render_gutter_hover_button(
+        &self,
+        _position: Anchor,
+        _row: DisplayRow,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<AnyElement> {
+        None
+    }
+
     fn override_status_for_buffer_id(&self, _: BufferId, _: &App) -> Option<FileStatus> {
         None
     }
