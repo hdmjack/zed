@@ -30,7 +30,7 @@ use std::sync::Arc;
 use ui::{
     Button, ButtonSize, Checkbox, Color, ContextMenu, DynamicSpacing, IconButton, IconName,
     IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, Tab, ToggleState,
-    Tooltip, div, h_flex, prelude::*, v_flex,
+    Tooltip, h_flex, prelude::*, v_flex,
 };
 use workspace::{
     Workspace,
@@ -88,8 +88,10 @@ pub struct ReviewPanel {
     /// Whether the PR's diff has been auto-opened for the current selection.
     pr_diff_opened: bool,
     injected_comment_blocks: HashMap<EntityId, (WeakEntity<Editor>, Vec<CustomBlockId>)>,
-    /// The currently open inline reply composer, if any.
-    inline_composer: Option<InlineComposer>,
+    /// Open inline composers (replies and new comments). Multiple can be open at
+    /// once; each is identified by `id`.
+    inline_composers: Vec<InlineComposer>,
+    next_composer_id: usize,
     _workspace_subscription: Option<Subscription>,
 }
 
@@ -97,6 +99,7 @@ pub struct ReviewPanel {
 /// line). Both are rendered as blocks produced by the single inject pass, so no
 /// separate `insert_blocks` call is made (which previously panicked block_map).
 struct InlineComposer {
+    id: usize,
     editor: WeakEntity<Editor>,
     input: Entity<Editor>,
     submitting: bool,
@@ -319,7 +322,8 @@ impl ReviewPanel {
             pending_action: None,
             pr_diff_opened: false,
             injected_comment_blocks: HashMap::default(),
-            inline_composer: None,
+            inline_composers: Vec::new(),
+            next_composer_id: 0,
             _workspace_subscription: workspace_subscription,
         };
         // Create the PR list up front so pull requests start loading in the
@@ -1012,37 +1016,39 @@ impl ReviewPanel {
             }
         }
 
-        // A pending new-comment composer is emitted in the same insert pass.
-        if let Some(composer) = &self.inline_composer {
-            if let ComposerTarget::New { path, line, .. } = &composer.target {
-                let row = line.saturating_sub(1);
-                let anchor = multibuffer.read(cx).all_buffers().into_iter().find_map(|buffer| {
-                    let buffer = buffer.read(cx);
-                    let file = buffer.file()?;
-                    let file_path = SharedString::from(
-                        file.path().as_std_path().to_string_lossy().to_string(),
-                    );
-                    if &file_path != path {
-                        return None;
-                    }
-                    let buffer_snapshot = buffer.snapshot();
-                    if row > buffer_snapshot.max_point().row {
-                        return None;
-                    }
-                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(Point::new(row, 0)))
-                });
-                if let Some(anchor) = anchor {
-                    let input = composer.input.clone();
-                    blocks.push(BlockProperties {
-                        placement: BlockPlacement::Below(anchor),
-                        height: Some(6),
-                        style: BlockStyle::Sticky,
-                        render: Arc::new(move |cx| {
-                            render_composer_block(input.clone(), weak_panel.clone(), cx)
-                        }),
-                        priority: 1,
-                    });
+        // Pending new-comment composers are emitted in the same insert pass.
+        for composer in &self.inline_composers {
+            let ComposerTarget::New { path, line, .. } = &composer.target else {
+                continue;
+            };
+            let row = line.saturating_sub(1);
+            let anchor = multibuffer.read(cx).all_buffers().into_iter().find_map(|buffer| {
+                let buffer = buffer.read(cx);
+                let file = buffer.file()?;
+                let file_path =
+                    SharedString::from(file.path().as_std_path().to_string_lossy().to_string());
+                if &file_path != path {
+                    return None;
                 }
+                let buffer_snapshot = buffer.snapshot();
+                if row > buffer_snapshot.max_point().row {
+                    return None;
+                }
+                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(Point::new(row, 0)))
+            });
+            if let Some(anchor) = anchor {
+                let input = composer.input.clone();
+                let composer_id = composer.id;
+                let weak_panel = weak_panel.clone();
+                blocks.push(BlockProperties {
+                    placement: BlockPlacement::Below(anchor),
+                    height: Some(6),
+                    style: BlockStyle::Sticky,
+                    render: Arc::new(move |cx| {
+                        render_composer_block(input.clone(), composer_id, weak_panel.clone(), cx)
+                    }),
+                    priority: 1,
+                });
             }
         }
 
@@ -1070,13 +1076,14 @@ impl ReviewPanel {
         let editor_id = editor.entity_id();
         let weak_panel = cx.weak_entity();
         let weak_editor = editor.downgrade();
-        let composing_root = self.inline_composer.as_ref().and_then(|composer| {
-            if let ComposerTarget::Reply { in_reply_to } = &composer.target {
-                Some(*in_reply_to)
-            } else {
-                None
-            }
-        });
+        let composing_roots: Vec<u64> = self
+            .inline_composers
+            .iter()
+            .filter_map(|composer| match &composer.target {
+                ComposerTarget::Reply { in_reply_to } => Some(*in_reply_to),
+                ComposerTarget::New { .. } => None,
+            })
+            .collect();
         let block_ids = editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let max_row = snapshot.max_point().row;
@@ -1090,7 +1097,7 @@ impl ReviewPanel {
                     }
                     let anchor = snapshot.anchor_before(Point::new(row, 0));
                     let root_id = thread_comments.first().map(|(comment, _, _)| comment.id);
-                    let composing = root_id.is_some() && root_id == composing_root;
+                    let composing = root_id.is_some_and(|id| composing_roots.contains(&id));
                     let height = Self::estimate_block_height(&thread_comments)
                         + 2
                         + if composing { 12 } else { 0 };
@@ -1147,6 +1154,14 @@ impl ReviewPanel {
         let Some(editor) = target_editor.upgrade() else {
             return;
         };
+        // Only one reply composer per thread; focus the existing one if open.
+        if let Some(existing) = self.inline_composers.iter().find(|c| {
+            matches!(&c.target, ComposerTarget::Reply { in_reply_to: id } if *id == in_reply_to)
+        }) {
+            window.focus(&existing.input.focus_handle(cx), cx);
+            cx.notify();
+            return;
+        }
 
         let input = cx.new(|cx| {
             let mut editor = Editor::auto_height(2, 4, window, cx);
@@ -1159,14 +1174,27 @@ impl ReviewPanel {
         });
         window.focus(&input.focus_handle(cx), cx);
 
-        self.inline_composer = Some(InlineComposer {
-            editor: target_editor,
-            input,
-            submitting: false,
-            target: ComposerTarget::Reply { in_reply_to },
-        });
+        self.add_composer(target_editor, input, ComposerTarget::Reply { in_reply_to });
         self.reinject_inline_blocks(&editor, cx);
         cx.notify();
+    }
+
+    fn add_composer(
+        &mut self,
+        editor: WeakEntity<Editor>,
+        input: Entity<Editor>,
+        target: ComposerTarget,
+    ) -> usize {
+        let id = self.next_composer_id;
+        self.next_composer_id += 1;
+        self.inline_composers.push(InlineComposer {
+            id,
+            editor,
+            input,
+            submitting: false,
+            target,
+        });
+        id
     }
 
     /// Open a new-comment composer for the active editor's current selection
@@ -1198,17 +1226,16 @@ impl ReviewPanel {
         });
         window.focus(&input.focus_handle(cx), cx);
 
-        self.inline_composer = Some(InlineComposer {
-            editor: target_editor,
+        self.add_composer(
+            target_editor,
             input,
-            submitting: false,
-            target: ComposerTarget::New {
+            ComposerTarget::New {
                 path,
                 commit_id,
                 start_line,
                 line,
             },
-        });
+        );
         self.reinject_inline_blocks(&editor, cx);
         cx.notify();
     }
@@ -1244,12 +1271,11 @@ impl ReviewPanel {
         Some((path, start_line, line))
     }
 
-    /// True when the reply composer is open for the given thread root.
+    /// True when a reply composer is open for the given thread root.
     fn is_composing_for(&self, root_id: u64) -> bool {
-        matches!(
-            self.inline_composer.as_ref().map(|c| &c.target),
-            Some(ComposerTarget::Reply { in_reply_to }) if *in_reply_to == root_id
-        )
+        self.inline_composers.iter().any(|c| {
+            matches!(&c.target, ComposerTarget::Reply { in_reply_to } if *in_reply_to == root_id)
+        })
     }
 
     /// Re-render injected inline comment blocks (after reactions load or toggle)
@@ -1280,10 +1306,11 @@ impl ReviewPanel {
         self.inject_for_multibuffer_editor(editor, &review_view, cx);
     }
 
-    fn cancel_inline_composer(&mut self, cx: &mut Context<Self>) {
-        let Some(composer) = self.inline_composer.take() else {
+    fn cancel_inline_composer(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(pos) = self.inline_composers.iter().position(|c| c.id == id) else {
             return;
         };
+        let composer = self.inline_composers.remove(pos);
         let editor = composer.editor;
         let weak_self = cx.weak_entity();
         cx.notify();
@@ -1299,8 +1326,8 @@ impl ReviewPanel {
         });
     }
 
-    fn submit_inline_composer(&mut self, cx: &mut Context<Self>) {
-        let Some(composer) = self.inline_composer.as_ref() else {
+    fn submit_inline_composer(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(composer) = self.inline_composers.iter().find(|c| c.id == id) else {
             return;
         };
         if composer.submitting {
@@ -1331,7 +1358,7 @@ impl ReviewPanel {
         };
         let number = pr.number;
 
-        if let Some(composer) = self.inline_composer.as_mut() {
+        if let Some(composer) = self.inline_composers.iter_mut().find(|c| c.id == id) {
             composer.submitting = true;
         }
         cx.notify();
@@ -1353,7 +1380,7 @@ impl ReviewPanel {
                 }
             };
             this.update(cx, |this, cx| {
-                this.inline_composer = None;
+                this.inline_composers.retain(|c| c.id != id);
                 if let Some((review_view, _)) = &this.review_view {
                     let review_view = review_view.clone();
                     review_view.update(cx, |review_view, cx| {
@@ -1741,16 +1768,16 @@ fn render_comment_thread_with_reply(
         weak_panel.upgrade().and_then(|panel| {
             let panel = panel.read(cx);
             panel
-                .inline_composer
-                .as_ref()
-                .filter(|composer| {
+                .inline_composers
+                .iter()
+                .find(|composer| {
                     matches!(&composer.target, ComposerTarget::Reply { in_reply_to } if *in_reply_to == root_id)
                 })
-                .map(|composer| (composer.input.clone(), composer.submitting))
+                .map(|composer| (composer.input.clone(), composer.submitting, composer.id))
         })
     });
 
-    if let Some((input, submitting)) = composer {
+    if let Some((input, submitting, composer_id)) = composer {
         let cancel_panel = weak_panel.clone();
         container = container.child(
             v_flex()
@@ -1759,43 +1786,53 @@ fn render_comment_thread_with_reply(
                 .pr_2()
                 .pb_2()
                 .pt_1()
-                .gap_2()
                 .child(
-                    div()
+                    v_flex()
                         .w_full()
                         .px_2()
                         .py_1()
+                        .gap_2()
                         .rounded_md()
                         .border_1()
                         .border_color(colors.border_variant)
                         .bg(colors.element_background)
-                        .child(input),
-                )
-                .child(
+                        .child(input)
+                        .child(
                     h_flex()
                         .justify_end()
                         .gap_1()
                         .child(
-                            Button::new("inline-composer-cancel", "Cancel")
+                            Button::new(
+                                SharedString::from(format!("inline-composer-cancel-{composer_id}")),
+                                "Cancel",
+                            )
                                 .size(ButtonSize::Compact)
                                 .label_size(LabelSize::Small)
                                 .on_click(move |_, _window, cx| {
                                     cancel_panel
-                                        .update(cx, |panel, cx| panel.cancel_inline_composer(cx))
+                                        .update(cx, |panel, cx| {
+                                            panel.cancel_inline_composer(composer_id, cx)
+                                        })
                                         .ok();
                                 }),
                         )
                         .child(
-                            Button::new("inline-composer-submit", "Reply")
+                            Button::new(
+                                SharedString::from(format!("inline-composer-submit-{composer_id}")),
+                                "Reply",
+                            )
                                 .size(ButtonSize::Compact)
                                 .label_size(LabelSize::Small)
-                                .style(ui::ButtonStyle::Filled)
+                                .style(ui::ButtonStyle::Tinted(ui::TintColor::Accent))
                                 .disabled(submitting)
                                 .on_click(move |_, _window, cx| {
                                     weak_panel
-                                        .update(cx, |panel, cx| panel.submit_inline_composer(cx))
+                                        .update(cx, |panel, cx| {
+                                            panel.submit_inline_composer(composer_id, cx)
+                                        })
                                         .ok();
                                 }),
+                        ),
                         ),
                 ),
         );
@@ -1822,6 +1859,7 @@ fn render_comment_thread_with_reply(
 /// Render a standalone new-comment composer block (text input + Cancel/Comment).
 fn render_composer_block(
     input: Entity<Editor>,
+    composer_id: usize,
     weak_panel: WeakEntity<ReviewPanel>,
     cx: &mut BlockContext,
 ) -> AnyElement {
@@ -1829,7 +1867,14 @@ fn render_composer_block(
     let anchor_x = cx.anchor_x;
     let submitting = weak_panel
         .upgrade()
-        .and_then(|panel| panel.read(cx).inline_composer.as_ref().map(|c| c.submitting))
+        .and_then(|panel| {
+            panel
+                .read(cx)
+                .inline_composers
+                .iter()
+                .find(|c| c.id == composer_id)
+                .map(|c| c.submitting)
+        })
         .unwrap_or(false);
     let cancel_panel = weak_panel.clone();
 
@@ -1839,45 +1884,55 @@ fn render_composer_block(
         .pl(anchor_x)
         .pr_2()
         .py_2()
-        .gap_2()
         .bg(colors.editor_background)
         .child(
-            div()
+            v_flex()
                 .w_full()
                 .min_w_0()
                 .px_2()
                 .py_1()
+                .gap_2()
                 .rounded_md()
                 .border_1()
                 .border_color(colors.border_variant)
                 .bg(colors.element_background)
-                .child(input),
-        )
-        .child(
-            h_flex()
-                .justify_end()
-                .gap_1()
+                .child(input)
                 .child(
-                    Button::new("new-comment-cancel", "Cancel")
-                        .size(ButtonSize::Compact)
-                        .label_size(LabelSize::Small)
-                        .on_click(move |_, _window, cx| {
-                            cancel_panel
-                                .update(cx, |panel, cx| panel.cancel_inline_composer(cx))
-                                .ok();
-                        }),
-                )
-                .child(
-                    Button::new("new-comment-submit", "Comment")
-                        .size(ButtonSize::Compact)
-                        .label_size(LabelSize::Small)
-                        .style(ui::ButtonStyle::Filled)
-                        .disabled(submitting)
-                        .on_click(move |_, _window, cx| {
-                            weak_panel
-                                .update(cx, |panel, cx| panel.submit_inline_composer(cx))
-                                .ok();
-                        }),
+                    h_flex()
+                        .justify_end()
+                        .gap_1()
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("new-comment-cancel-{composer_id}")),
+                                "Cancel",
+                            )
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .on_click(move |_, _window, cx| {
+                                cancel_panel
+                                    .update(cx, |panel, cx| {
+                                        panel.cancel_inline_composer(composer_id, cx)
+                                    })
+                                    .ok();
+                            }),
+                        )
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("new-comment-submit-{composer_id}")),
+                                "Comment",
+                            )
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .style(ui::ButtonStyle::Tinted(ui::TintColor::Accent))
+                            .disabled(submitting)
+                            .on_click(move |_, _window, cx| {
+                                weak_panel
+                                    .update(cx, |panel, cx| {
+                                        panel.submit_inline_composer(composer_id, cx)
+                                    })
+                                    .ok();
+                            }),
+                        ),
                 ),
         )
         .into_any_element()
