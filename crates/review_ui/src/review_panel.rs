@@ -1,4 +1,3 @@
-use crate::file_list::{FileList, FileListEvent};
 use crate::github_provider::GitHubProvider;
 use crate::inline_comment::{ApplySuggestion, ReactToComment, comment_markdown, parse_suggestions, render_pr_comment_block, SuggestionBlock};
 use crate::pull_request_list::{PullRequestList, PullRequestListEvent, RemoteState};
@@ -65,7 +64,6 @@ enum ActiveView {
     Empty,
     PullRequestList,
     ReviewThread,
-    FileList,
     Configuration,
 }
 
@@ -82,7 +80,6 @@ pub struct ReviewPanel {
     base_branch: Option<SharedString>,
     head_branch: Option<SharedString>,
     tree_diff: Option<TreeDiff>,
-    file_list: Option<(Entity<FileList>, Subscription)>,
     review_view: Option<(Entity<ReviewView>, Subscription)>,
     focus_handle: FocusHandle,
     recent_reviews_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -322,7 +319,6 @@ impl ReviewPanel {
             base_branch: None,
             head_branch: None,
             tree_diff: None,
-            file_list: None,
             review_view: None,
             focus_handle: cx.focus_handle(),
             fs,
@@ -503,16 +499,8 @@ impl ReviewPanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let weak_panel = cx.weak_entity();
-        let show_tree_toggle = matches!(
-            self.active_view,
-            ActiveView::FileList | ActiveView::ReviewThread
-        );
+        let show_tree_toggle = matches!(self.active_view, ActiveView::ReviewThread);
         let is_tree_view = match &self.active_view {
-            ActiveView::FileList => self
-                .file_list
-                .as_ref()
-                .map(|(fl, _)| fl.read(cx).is_tree_view())
-                .unwrap_or(false),
             ActiveView::ReviewThread => self
                 .review_view
                 .as_ref()
@@ -543,18 +531,14 @@ impl ReviewPanel {
                             },
                             None,
                             {
-                                move |window, cx| {
+                                move |_window, cx| {
                                     weak_panel
                                         .update(cx, |this, cx| {
-                                            if is_review_thread {
-                                                if let Some((review_view, _)) = &this.review_view {
-                                                    review_view.update(cx, |rv, cx| {
-                                                        rv.toggle_tree_view(cx);
-                                                    });
-                                                }
-                                            } else if let Some((file_list, _)) = &this.file_list {
-                                                file_list.update(cx, |fl, cx| {
-                                                    fl.toggle_tree_view(window, cx);
+                                            if is_review_thread
+                                                && let Some((review_view, _)) = &this.review_view
+                                            {
+                                                review_view.update(cx, |rv, cx| {
+                                                    rv.toggle_tree_view(cx);
                                                 });
                                             }
                                         })
@@ -934,27 +918,6 @@ impl ReviewPanel {
         .detach_and_log_err(cx);
     }
 
-    fn show_file_list(&mut self, cx: &mut Context<Self>) {
-        let file_list = cx.new(|cx| {
-            FileList::new(
-                self.base_branch.clone(),
-                self.head_branch.clone(),
-                self.tree_diff.as_ref(),
-                cx,
-            )
-        });
-        let subscription = cx.subscribe(&file_list, |this, _file_list, event, cx| match event {
-            FileListEvent::OpenFileDiff(path) => {
-                this.open_file_diff(path.clone(), cx);
-            }
-            FileListEvent::OpenLocalFile(path) => {
-                this.open_local_file_by_path(path.clone(), cx);
-            }
-        });
-        self.file_list = Some((file_list, subscription));
-        self.active_view = ActiveView::FileList;
-        cx.notify();
-    }
 
     fn ensure_pull_request_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.pull_request_list.is_some() {
@@ -990,13 +953,6 @@ impl ReviewPanel {
     }
 
     fn open_file_diff(&mut self, path: RepoPath, cx: &mut Context<Self>) {
-        if let Some((file_list, _)) = &self.file_list {
-            file_list.update(cx, |fl, cx| {
-                fl.mark_viewed(path.clone(), cx);
-                fl.select_path(&path, cx);
-            });
-        }
-
         self.pending_action = Some(PendingAction::OpenDiff(path));
         cx.notify();
     }
@@ -1759,19 +1715,6 @@ impl Render for ReviewPanel {
                 ActiveView::ReviewThread => {
                     if let Some((review_view, _)) = &self.review_view {
                         parent.child(review_view.clone())
-                    } else {
-                        parent.child(
-                            v_flex()
-                                .size_full()
-                                .justify_center()
-                                .items_center()
-                                .child(Label::new("Loading...").color(Color::Muted)),
-                        )
-                    }
-                }
-                ActiveView::FileList => {
-                    if let Some((file_list, _)) = &self.file_list {
-                        parent.child(file_list.clone())
                     } else {
                         parent.child(
                             v_flex()
