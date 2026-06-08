@@ -197,9 +197,19 @@ pub enum MergeMethod {
 }
 
 impl MergeMethod {
+    /// Label for the merge-method dropdown entries.
     pub fn label(self) -> &'static str {
         match self {
             MergeMethod::Merge => "Create a merge commit",
+            MergeMethod::Squash => "Squash and merge",
+            MergeMethod::Rebase => "Rebase and merge",
+        }
+    }
+
+    /// Label for the merge action button, reflecting the selected strategy.
+    pub fn button_label(self) -> &'static str {
+        match self {
+            MergeMethod::Merge => "Merge commit",
             MergeMethod::Squash => "Squash and merge",
             MergeMethod::Rebase => "Rebase and merge",
         }

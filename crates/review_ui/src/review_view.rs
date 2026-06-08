@@ -1095,7 +1095,7 @@ impl ReviewView {
         let label = if self.merging {
             "Merging…"
         } else {
-            "Merge pull request"
+            self.merge_method.button_label()
         };
         SplitButton::new(
             ButtonLike::new_rounded_left("merge-left")
