@@ -490,7 +490,6 @@ impl Render for PullRequestList {
         let filter_label = match &self.filter {
             PullRequestState::Open => "Open",
             PullRequestState::Closed => "Closed",
-            PullRequestState::Merged => "Merged",
             PullRequestState::All => "All",
         };
         let filtered_count = self.filtered.len();

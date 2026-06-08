@@ -6,7 +6,6 @@ use std::pin::Pin;
 pub enum PullRequestState {
     Open,
     Closed,
-    Merged,
     All,
 }
 
@@ -23,7 +22,7 @@ pub enum FileChangeStatus {
     Added,
     Modified,
     Deleted,
-    Renamed { from: SharedString },
+    Renamed,
 }
 
 /// One page of pull requests plus the cursor needed to fetch the next page and
@@ -160,14 +159,6 @@ pub struct CommentReactions {
     pub reactions: Vec<ReactionGroup>,
 }
 
-#[derive(Clone, Debug)]
-pub enum CheckStatus {
-    Pending,
-    Success,
-    Failure,
-    Cancelled,
-}
-
 /// Aggregate CI rollup state for a PR's head commit.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CheckRollup {
@@ -191,30 +182,11 @@ pub struct PullRequestStatus {
     pub labels: Vec<PrLabel>,
 }
 
-#[derive(Clone, Debug)]
-pub struct CheckRun {
-    pub name: SharedString,
-    pub status: CheckStatus,
-    pub url: Option<SharedString>,
-    pub started_at: Option<SharedString>,
-    pub completed_at: Option<SharedString>,
-}
-
+/// Full PR data fetched on demand. Only `info` is currently consumed (when
+/// restoring a review); the fetch is kept coarse for future use.
 #[derive(Clone, Debug)]
 pub struct PullRequestDetails {
     pub info: PullRequestInfo,
-    pub files: Vec<PullRequestFile>,
-    pub comments: Vec<ReviewComment>,
-    pub checks: Vec<CheckRun>,
-    pub mergeable: Option<bool>,
-    pub labels: Vec<SharedString>,
-}
-
-#[derive(Clone, Debug)]
-pub enum MergeMethod {
-    Merge,
-    Squash,
-    Rebase,
 }
 
 #[derive(Clone, Debug)]
@@ -224,8 +196,6 @@ pub struct PullRequestInfo {
     pub node_id: SharedString,
     pub title: SharedString,
     pub author: SharedString,
-    pub description: SharedString,
-    pub state: PullRequestState,
     pub base_ref: SharedString,
     pub head_ref: SharedString,
     pub base_sha: SharedString,
@@ -245,7 +215,6 @@ pub struct PullRequestInfo {
 }
 
 pub trait ReviewProvider: Send + Sync {
-    fn name(&self) -> &'static str;
     /// Fetch one page of pull requests. `after` is the opaque cursor returned by
     /// a previous page (None for the first page).
     fn fetch_pull_requests(
@@ -361,16 +330,6 @@ pub trait ReviewProvider: Send + Sync {
         Box::pin(async { Err(anyhow::anyhow!("reactions not supported by this provider")) })
     }
 
-    fn merge_pull_request(
-        &self,
-        _owner: &str,
-        _repo: &str,
-        _number: u32,
-        _merge_method: MergeMethod,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
-        Box::pin(async { Err(anyhow::anyhow!("merge not supported by this provider")) })
-    }
-
     /// Paths the current user has marked as viewed on this PR (by GraphQL node id).
     fn fetch_viewed_files(
         &self,
@@ -385,61 +344,4 @@ pub trait ReviewProvider: Send + Sync {
         viewed: bool,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>>;
 
-    fn request_reviewers(
-        &self,
-        _owner: &str,
-        _repo: &str,
-        _number: u32,
-        _reviewers: &[&str],
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
-        Box::pin(async {
-            Err(anyhow::anyhow!(
-                "request reviewers not supported by this provider"
-            ))
-        })
-    }
-
-    fn fetch_checks(
-        &self,
-        _owner: &str,
-        _repo: &str,
-        _number: u32,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<CheckRun>>> + Send>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn fetch_mergeable(
-        &self,
-        _owner: &str,
-        _repo: &str,
-        _number: u32,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<bool>>> + Send>> {
-        Box::pin(async { Ok(None) })
-    }
-
-    fn fetch_labels(
-        &self,
-        _owner: &str,
-        _repo: &str,
-        _number: u32,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<SharedString>>> + Send>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn apply_suggestion(
-        &self,
-        _owner: &str,
-        _repo: &str,
-        _number: u32,
-        _comment_id: u64,
-        _suggested_code: &str,
-        _path: &str,
-        _line: u32,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
-        Box::pin(async {
-            Err(anyhow::anyhow!(
-                "apply suggestion not supported by this provider"
-            ))
-        })
-    }
 }

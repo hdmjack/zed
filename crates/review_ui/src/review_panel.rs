@@ -61,15 +61,12 @@ struct RecentReview {
 }
 
 enum ActiveView {
-    Empty,
     PullRequestList,
     ReviewThread,
-    Configuration,
 }
 
 enum PendingAction {
     OpenDiff(RepoPath),
-    OpenLocal(RepoPath),
     SelectPullRequest(PullRequestInfo),
 }
 
@@ -957,11 +954,6 @@ impl ReviewPanel {
         cx.notify();
     }
 
-    fn open_local_file_by_path(&mut self, path: RepoPath, cx: &mut Context<Self>) {
-        self.pending_action = Some(PendingAction::OpenLocal(path));
-        cx.notify();
-    }
-
     fn on_active_item_changed(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
         if self.selected_pr.is_none() {
             return;
@@ -1646,24 +1638,6 @@ impl ReviewPanel {
                     window.dispatch_action(Box::new(git_ui::project_diff::BranchDiff), cx);
                 }
             }
-            PendingAction::OpenLocal(path) => {
-                let Some(active_repo) = self.active_repository.as_ref() else {
-                    return;
-                };
-                let Some(project_path) =
-                    active_repo.read(cx).repo_path_to_project_path(&path, cx)
-                else {
-                    return;
-                };
-                let Some(workspace) = self._workspace.upgrade() else {
-                    return;
-                };
-                workspace.update(cx, |workspace, cx| {
-                    workspace
-                        .open_path_preview(project_path, None, true, false, true, window, cx)
-                        .detach_and_log_err(cx);
-                });
-            }
             PendingAction::SelectPullRequest(pr) => {
                 self.create_review_view(&pr, window, cx);
                 // Open the combined diff tab immediately (empty until the ref
@@ -1692,13 +1666,6 @@ impl Render for ReviewPanel {
             .size_full()
             .child(self.render_toolbar(window, cx))
             .map(|parent| match &self.active_view {
-                ActiveView::Empty => parent.child(
-                    v_flex()
-                        .size_full()
-                        .justify_center()
-                        .items_center()
-                        .child(Label::new("No review selected").color(Color::Muted)),
-                ),
                 ActiveView::PullRequestList => {
                     if let Some((pr_list, _)) = &self.pull_request_list {
                         parent.child(pr_list.clone())
@@ -1725,13 +1692,6 @@ impl Render for ReviewPanel {
                         )
                     }
                 }
-                ActiveView::Configuration => parent.child(
-                    v_flex()
-                        .size_full()
-                        .justify_center()
-                        .items_center()
-                        .child(Label::new("Configuration (coming soon)").color(Color::Muted)),
-                ),
             })
     }
 }

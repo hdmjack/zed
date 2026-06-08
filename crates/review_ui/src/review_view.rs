@@ -121,7 +121,6 @@ enum RowKind {
         body: Option<Entity<Markdown>>,
         /// Markdown for the one-line collapsed preview.
         preview: Entity<Markdown>,
-        path: SharedString,
         depth: usize,
         expanded: bool,
     },
@@ -732,7 +731,6 @@ impl ReviewView {
                     comment: comment.clone(),
                     body,
                     preview,
-                    path: path.clone(),
                     depth: 0,
                     expanded,
                 });
@@ -1285,7 +1283,7 @@ impl ReviewView {
                     Some(FileChangeStatus::Added) => (IconName::Plus, Color::Created),
                     Some(FileChangeStatus::Modified) => (IconName::Pencil, Color::Modified),
                     Some(FileChangeStatus::Deleted) => (IconName::Dash, Color::Deleted),
-                    Some(FileChangeStatus::Renamed { .. }) => (IconName::ArrowRight, Color::Modified),
+                    Some(FileChangeStatus::Renamed) => (IconName::ArrowRight, Color::Modified),
                     None => (IconName::File, Color::Muted),
                 };
                 let indent = *depth as f32 * TREE_INDENT + 8.0;
@@ -1385,7 +1383,6 @@ impl ReviewView {
                 comment,
                 body,
                 preview,
-                path: _,
                 depth,
                 expanded,
             } => {

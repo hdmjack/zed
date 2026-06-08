@@ -17,7 +17,6 @@ struct GhPullRequest {
     title: String,
     user: GhUser,
     body: Option<String>,
-    state: String,
     #[serde(default)]
     draft: bool,
     base: GhRef,
@@ -44,7 +43,6 @@ struct GhFile {
     status: String,
     additions: u32,
     deletions: u32,
-    previous_filename: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -65,7 +63,6 @@ struct GhReview {
     id: u64,
     user: GhUser,
     body: Option<String>,
-    state: String,
     submitted_at: Option<String>,
 }
 
@@ -133,22 +130,12 @@ async fn github_post<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&body).context("failed to parse GitHub response")
 }
 
-fn map_pr_state(state: &str) -> PullRequestState {
-    match state {
-        "open" => PullRequestState::Open,
-        "closed" => PullRequestState::Closed,
-        _ => PullRequestState::Closed,
-    }
-}
-
-fn map_file_status(status: &str, previous_filename: Option<String>) -> FileChangeStatus {
+fn map_file_status(status: &str) -> FileChangeStatus {
     match status {
         "added" => FileChangeStatus::Added,
         "modified" | "changed" => FileChangeStatus::Modified,
         "removed" => FileChangeStatus::Deleted,
-        "renamed" => FileChangeStatus::Renamed {
-            from: previous_filename.unwrap_or_default().into(),
-        },
+        "renamed" => FileChangeStatus::Renamed,
         _ => FileChangeStatus::Modified,
     }
 }
@@ -159,8 +146,6 @@ fn map_pull_request(pr: GhPullRequest) -> PullRequestInfo {
         node_id: pr.node_id.into(),
         title: pr.title.into(),
         author: pr.user.login.into(),
-        description: pr.body.unwrap_or_default().into(),
-        state: map_pr_state(&pr.state),
         base_ref: pr.base.ref_name.into(),
         head_ref: pr.head.ref_name.into(),
         base_sha: pr.base.sha.into(),
@@ -180,7 +165,7 @@ fn map_pull_request(pr: GhPullRequest) -> PullRequestInfo {
 fn map_file(file: GhFile) -> PullRequestFile {
     PullRequestFile {
         path: file.filename.into(),
-        status: map_file_status(&file.status, file.previous_filename),
+        status: map_file_status(&file.status),
         additions: file.additions,
         deletions: file.deletions,
     }
@@ -249,7 +234,6 @@ struct GqlPullRequest {
     number: u32,
     id: String,
     title: String,
-    state: String,
     created_at: String,
     updated_at: String,
     base_ref_name: String,
@@ -474,14 +458,6 @@ fn map_check_rollup(state: &str) -> CheckRollup {
     }
 }
 
-fn map_graphql_state(state: &str) -> PullRequestState {
-    match state {
-        "OPEN" => PullRequestState::Open,
-        "MERGED" => PullRequestState::Merged,
-        _ => PullRequestState::Closed,
-    }
-}
-
 fn map_review_decision(decision: Option<&str>) -> ReviewStatus {
     match decision {
         Some("APPROVED") => ReviewStatus::Approved,
@@ -496,9 +472,6 @@ fn map_graphql_pr(pr: GqlPullRequest) -> PullRequestInfo {
         node_id: pr.id.into(),
         title: pr.title.into(),
         author: pr.author.map(|a| a.login).unwrap_or_default().into(),
-        // The list doesn't render the body; fetch it lazily with PR details.
-        description: SharedString::default(),
-        state: map_graphql_state(&pr.state),
         base_ref: pr.base_ref_name.into(),
         head_ref: pr.head_ref_name.into(),
         base_sha: pr.base_ref_oid.into(),
@@ -559,10 +532,6 @@ impl GitHubProvider {
 }
 
 impl ReviewProvider for GitHubProvider {
-    fn name(&self) -> &'static str {
-        "GitHub"
-    }
-
     fn fetch_pull_requests(
         &self,
         owner: &str,
@@ -575,7 +544,6 @@ impl ReviewProvider for GitHubProvider {
         let states_clause = match &state {
             PullRequestState::Open => "states: [OPEN], ",
             PullRequestState::Closed => "states: [CLOSED, MERGED], ",
-            PullRequestState::Merged => "states: [MERGED], ",
             PullRequestState::All => "",
         };
         let query = format!(
@@ -643,22 +611,13 @@ impl ReviewProvider for GitHubProvider {
         number: u32,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<PullRequestDetails>> + Send>> {
         let pr_url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}");
-        let files_url =
-            format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/files?per_page=100");
         let http_client = self.http_client.clone();
         let token = self.token.clone();
 
         Box::pin(async move {
             let gh_pr: GhPullRequest = github_get(&http_client, &token, &pr_url).await?;
-            let gh_files: Vec<GhFile> = github_get(&http_client, &token, &files_url).await?;
-
             Ok(PullRequestDetails {
                 info: map_pull_request(gh_pr),
-                files: gh_files.into_iter().map(map_file).collect(),
-                comments: Vec::new(),
-                checks: Vec::new(),
-                mergeable: None,
-                labels: Vec::new(),
             })
         })
     }
@@ -1154,51 +1113,4 @@ impl ReviewProvider for GitHubProvider {
         })
     }
 
-    fn merge_pull_request(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: u32,
-        merge_method: MergeMethod,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
-        let method = match merge_method {
-            MergeMethod::Merge => "merge",
-            MergeMethod::Squash => "squash",
-            MergeMethod::Rebase => "rebase",
-        };
-        let url = format!("{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{number}/merge");
-        let json = serde_json::json!({ "merge_method": method }).to_string();
-        let http_client = self.http_client.clone();
-        let token = self.token.clone();
-
-        Box::pin(async move {
-            let mut builder = http_client::Request::builder()
-                .method(http_client::Method::PUT)
-                .uri(&url)
-                .header("Accept", "application/vnd.github.v3+json")
-                .header("Content-Type", "application/json")
-                .follow_redirects(RedirectPolicy::FollowAll);
-
-            if let Some(token) = &token {
-                builder = builder.header("Authorization", format!("Bearer {}", token));
-            }
-
-            let request = builder.body(AsyncBody::from(json))?;
-            let mut response = http_client.send(request).await?;
-
-            let mut body = Vec::new();
-            response.body_mut().read_to_end(&mut body).await?;
-
-            if !response.status().is_success() {
-                let text = String::from_utf8_lossy(&body);
-                bail!(
-                    "GitHub merge error {}: {}",
-                    response.status().as_u16(),
-                    text
-                );
-            }
-
-            Ok(())
-        })
-    }
 }

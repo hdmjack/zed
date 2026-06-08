@@ -1,7 +1,3 @@
-// This crate is an in-progress PR review feature; much of the provider API and
-// view scaffolding is implemented ahead of being wired up.
-#![allow(dead_code)]
-
 mod comment_card;
 mod file_list;
 mod github_provider;
