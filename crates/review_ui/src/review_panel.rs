@@ -1778,7 +1778,6 @@ fn render_comment_thread_with_reply(
     });
 
     if let Some((input, submitting, composer_id)) = composer {
-        let cancel_panel = weak_panel.clone();
         container = container.child(
             v_flex()
                 .max_w(max_width - anchor_x)
@@ -1786,55 +1785,13 @@ fn render_comment_thread_with_reply(
                 .pr_2()
                 .pb_2()
                 .pt_1()
-                .child(
-                    v_flex()
-                        .w_full()
-                        .px_2()
-                        .py_1()
-                        .gap_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(colors.border_variant)
-                        .bg(colors.element_background)
-                        .child(input)
-                        .child(
-                    h_flex()
-                        .justify_end()
-                        .gap_1()
-                        .child(
-                            Button::new(
-                                SharedString::from(format!("inline-composer-cancel-{composer_id}")),
-                                "Cancel",
-                            )
-                                .size(ButtonSize::Compact)
-                                .label_size(LabelSize::Small)
-                                .on_click(move |_, _window, cx| {
-                                    cancel_panel
-                                        .update(cx, |panel, cx| {
-                                            panel.cancel_inline_composer(composer_id, cx)
-                                        })
-                                        .ok();
-                                }),
-                        )
-                        .child(
-                            Button::new(
-                                SharedString::from(format!("inline-composer-submit-{composer_id}")),
-                                "Reply",
-                            )
-                                .size(ButtonSize::Compact)
-                                .label_size(LabelSize::Small)
-                                .style(ui::ButtonStyle::Tinted(ui::TintColor::Accent))
-                                .disabled(submitting)
-                                .on_click(move |_, _window, cx| {
-                                    weak_panel
-                                        .update(cx, |panel, cx| {
-                                            panel.submit_inline_composer(composer_id, cx)
-                                        })
-                                        .ok();
-                                }),
-                        ),
-                        ),
-                ),
+                .child(ComposerBubble {
+                    input,
+                    composer_id,
+                    submit_label: "Reply".into(),
+                    submitting,
+                    panel: weak_panel,
+                }),
         );
     } else if let Some(root_id) = root_id {
         container = container.child(
@@ -1856,7 +1813,73 @@ fn render_comment_thread_with_reply(
     container.into_any_element()
 }
 
-/// Render a standalone new-comment composer block (text input + Cancel/Comment).
+/// The bordered input bubble shared by the new-comment and reply composers: the
+/// text input plus Cancel/submit buttons. Centralizes the arrow-key handling so
+/// Move{Up,Down} (which editors propagate at the first/last line) stay inside the
+/// composer instead of bubbling to the parent diff editor and navigating the PR.
+#[derive(IntoElement)]
+struct ComposerBubble {
+    input: Entity<Editor>,
+    composer_id: usize,
+    submit_label: SharedString,
+    submitting: bool,
+    panel: WeakEntity<ReviewPanel>,
+}
+
+impl RenderOnce for ComposerBubble {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let id = self.composer_id;
+        let submit_panel = self.panel.clone();
+        let cancel_panel = self.panel;
+
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.element_background)
+            .on_action(|_: &zed_actions::editor::MoveUp, _window, _cx| {})
+            .on_action(|_: &zed_actions::editor::MoveDown, _window, _cx| {})
+            .child(self.input)
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_1()
+                    .child(
+                        Button::new(SharedString::from(format!("composer-cancel-{id}")), "Cancel")
+                            .size(ButtonSize::Compact)
+                            .label_size(LabelSize::Small)
+                            .on_click(move |_, _window, cx| {
+                                cancel_panel
+                                    .update(cx, |panel, cx| panel.cancel_inline_composer(id, cx))
+                                    .ok();
+                            }),
+                    )
+                    .child(
+                        Button::new(
+                            SharedString::from(format!("composer-submit-{id}")),
+                            self.submit_label,
+                        )
+                        .size(ButtonSize::Compact)
+                        .label_size(LabelSize::Small)
+                        .style(ui::ButtonStyle::Tinted(ui::TintColor::Accent))
+                        .disabled(self.submitting)
+                        .on_click(move |_, _window, cx| {
+                            submit_panel
+                                .update(cx, |panel, cx| panel.submit_inline_composer(id, cx))
+                                .ok();
+                        }),
+                    ),
+            )
+    }
+}
+
+/// Render a standalone new-comment composer block.
 fn render_composer_block(
     input: Entity<Editor>,
     composer_id: usize,
@@ -1876,7 +1899,6 @@ fn render_composer_block(
                 .map(|c| c.submitting)
         })
         .unwrap_or(false);
-    let cancel_panel = weak_panel.clone();
 
     v_flex()
         .w_full()
@@ -1885,56 +1907,13 @@ fn render_composer_block(
         .pr_2()
         .py_2()
         .bg(colors.editor_background)
-        .child(
-            v_flex()
-                .w_full()
-                .min_w_0()
-                .px_2()
-                .py_1()
-                .gap_2()
-                .rounded_md()
-                .border_1()
-                .border_color(colors.border_variant)
-                .bg(colors.element_background)
-                .child(input)
-                .child(
-                    h_flex()
-                        .justify_end()
-                        .gap_1()
-                        .child(
-                            Button::new(
-                                SharedString::from(format!("new-comment-cancel-{composer_id}")),
-                                "Cancel",
-                            )
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Small)
-                            .on_click(move |_, _window, cx| {
-                                cancel_panel
-                                    .update(cx, |panel, cx| {
-                                        panel.cancel_inline_composer(composer_id, cx)
-                                    })
-                                    .ok();
-                            }),
-                        )
-                        .child(
-                            Button::new(
-                                SharedString::from(format!("new-comment-submit-{composer_id}")),
-                                "Comment",
-                            )
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Small)
-                            .style(ui::ButtonStyle::Tinted(ui::TintColor::Accent))
-                            .disabled(submitting)
-                            .on_click(move |_, _window, cx| {
-                                weak_panel
-                                    .update(cx, |panel, cx| {
-                                        panel.submit_inline_composer(composer_id, cx)
-                                    })
-                                    .ok();
-                            }),
-                        ),
-                ),
-        )
+        .child(ComposerBubble {
+            input,
+            composer_id,
+            submit_label: "Comment".into(),
+            submitting,
+            panel: weak_panel,
+        })
         .into_any_element()
 }
 
