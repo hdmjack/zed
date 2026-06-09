@@ -75,19 +75,63 @@ fn sanitize_comment_html(body: &str) -> String {
 /// inline (pulldown otherwise passes inline `<img>`/`<a>` through as literal
 /// text). Handles `<picture>` wrappers, bare `<img>` → `![alt](src)`, and
 /// `<a href><img></a>` → `[![alt](src)](href)`.
+///
+/// Runs only outside code: fenced (``` / ~~~) blocks and inline `code` spans are
+/// passed through untouched so HTML in code examples isn't rewritten.
 fn rewrite_html_images(body: &str) -> String {
-    static PICTURE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?is)</?picture[^>]*>|<source\b[^>]*>").unwrap());
-    static IMG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<img\b[^>]*>").unwrap());
+    let mut out = String::with_capacity(body.len());
+    let mut fence: Option<char> = None;
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            let marker = trimmed.as_bytes()[0] as char;
+            match fence {
+                None => fence = Some(marker),
+                Some(open) if open == marker => fence = None,
+                _ => {}
+            }
+            out.push_str(line);
+        } else if fence.is_some() {
+            out.push_str(line);
+        } else {
+            out.push_str(&rewrite_outside_inline_code(line));
+        }
+    }
+    out
+}
+
+/// Rewrite HTML in a line, leaving inline `code` spans verbatim.
+fn rewrite_outside_inline_code(line: &str) -> String {
+    static CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`\n]*`").unwrap());
+    let mut out = String::with_capacity(line.len());
+    let mut last = 0;
+    for span in CODE.find_iter(line) {
+        out.push_str(&rewrite_html_chunk(&line[last..span.start()]));
+        out.push_str(span.as_str());
+        last = span.end();
+    }
+    out.push_str(&rewrite_html_chunk(&line[last..]));
+    out
+}
+
+fn rewrite_html_chunk(text: &str) -> String {
+    // Tag bodies allow `>` inside quoted attribute values.
+    static PICTURE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)</?picture\b(?:[^>"']|"[^"]*"|'[^']*')*>|<source\b(?:[^>"']|"[^"]*"|'[^']*')*>"#).unwrap()
+    });
+    static IMG: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)<img\b(?:[^>"']|"[^"]*"|'[^']*')*>"#).unwrap()
+    });
     static ANCHOR_IMG: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?is)(<a\b[^>]*>)\s*(!\[[^\]]*\]\([^)]*\))\s*</a>").unwrap()
+        Regex::new(r#"(?is)(<a\b(?:[^>"']|"[^"]*"|'[^']*')*>)\s*(!\[[^\]]*\]\([^)]*\))\s*</a>"#)
+            .unwrap()
     });
 
     // Drop <picture>/<source> wrappers, keeping the inner <img>.
-    let body = PICTURE.replace_all(body, "");
+    let text = PICTURE.replace_all(text, "");
 
     // Bare <img …> → ![alt](src). Leave the tag untouched if it has no src.
-    let body = IMG.replace_all(&body, |caps: &regex::Captures| {
+    let text = IMG.replace_all(&text, |caps: &regex::Captures| {
         let tag = &caps[0];
         match html_attr(tag, "src") {
             Some(src) => format!("![{}]({})", html_attr(tag, "alt").unwrap_or_default(), src),
@@ -97,7 +141,7 @@ fn rewrite_html_images(body: &str) -> String {
 
     // <a href><img></a> (now <a href>![alt](src)</a>) → [![alt](src)](href).
     ANCHOR_IMG
-        .replace_all(&body, |caps: &regex::Captures| match html_attr(&caps[1], "href") {
+        .replace_all(&text, |caps: &regex::Captures| match html_attr(&caps[1], "href") {
             Some(href) => format!("[{}]({})", &caps[2], href),
             None => caps[2].to_string(),
         })
