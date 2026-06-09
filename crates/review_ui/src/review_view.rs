@@ -11,8 +11,9 @@ use git::repository::RepoPath;
 use git::status::{TreeDiff, TreeDiffStatus};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use gpui::{
-    Anchor, AnyElement, Context, Entity, EventEmitter, Focusable, ListAlignment, ListState, Render,
-    SharedString, Window, list, px,
+    Anchor, AnyElement, Context, Entity, EventEmitter, Focusable, ListAlignment, ListState,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, SharedString, Window,
+    list, px,
 };
 use std::sync::Arc;
 use ui::{
@@ -20,6 +21,13 @@ use ui::{
     IconName, IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, SplitButton,
     ToggleState, Tooltip, div, h_flex, prelude::*, v_flex,
 };
+
+/// Which resizable section a divider drag is adjusting.
+#[derive(Clone, Copy, PartialEq)]
+enum ResizeSection {
+    Header,
+    Comments,
+}
 
 pub enum ReviewViewEvent {
     OpenFileDiff(RepoPath),
@@ -97,6 +105,12 @@ pub struct ReviewView {
     // lists with their own scroll state.
     file_list_state: ListState,
     comment_list_state: ListState,
+    /// Height of the summary header and the bottom comments panel; the files
+    /// panel fills the space between them. Adjusted by dragging the dividers.
+    header_height: Pixels,
+    comments_height: Pixels,
+    /// Which divider is being dragged and the last cursor y (None when idle).
+    section_resize: Option<(ResizeSection, Pixels)>,
     // Cached per-data-change so `render` does no per-frame recompute.
     file_entries: Vec<(SharedString, Option<FileChangeStatus>, u32, u32)>,
     file_comments: HashMap<SharedString, Vec<ReviewComment>>,
@@ -252,6 +266,9 @@ impl ReviewView {
             viewed_files: HashSet::default(),
             file_list_state: ListState::new(0, ListAlignment::Top, px(1024.0)),
             comment_list_state: ListState::new(0, ListAlignment::Top, px(1024.0)),
+            header_height: px(160.0),
+            comments_height: px(220.0),
+            section_resize: None,
             file_entries: Vec::new(),
             file_comments: HashMap::default(),
             general_comments: Vec::new(),
@@ -1821,18 +1838,91 @@ impl Render for ReviewView {
             .child(section_header(files_label))
             .child(files);
         let comments_panel = v_flex()
-            .flex_1()
+            .h(self.comments_height)
+            .flex_none()
             .min_h_0()
             .min_w_0()
             .overflow_x_hidden()
-            .border_t_1()
-            .border_color(border)
             .child(section_header(SharedString::from("Comments")))
             .child(comments);
+
+        // Draggable dividers: header↔files and files↔comments. Only the resize
+        // cursor signals interactivity — no hover fill or active highlight.
+        let header_divider = div()
+            .id("header-files-divider")
+            .flex_none()
+            .h(px(7.0))
+            .w_full()
+            .occlude()
+            .cursor_row_resize()
+            .border_b_1()
+            .border_color(border)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    this.section_resize = Some((ResizeSection::Header, event.position.y));
+                    cx.stop_propagation();
+                }),
+            );
+        let comments_divider = div()
+            .id("files-comments-divider")
+            .flex_none()
+            .h(px(7.0))
+            .w_full()
+            .occlude()
+            .cursor_row_resize()
+            .border_b_1()
+            .border_color(border)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    this.section_resize = Some((ResizeSection::Comments, event.position.y));
+                    cx.stop_propagation();
+                }),
+            );
+
+        // While dragging the divider, a full-size transparent overlay captures
+        // mouse move/up so the drag tracks (and releases) even when the cursor
+        // leaves the thin divider. Element handlers can't be registered at the
+        // window level from a Render, so this overlay stands in for that.
+        let resize_overlay = self.section_resize.is_some().then(|| {
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .cursor_row_resize()
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                    let Some((section, last_y)) = this.section_resize else {
+                        return;
+                    };
+                    let delta = event.position.y - last_y;
+                    match section {
+                        // Dragging down grows the header (files absorbs the change).
+                        ResizeSection::Header => {
+                            this.header_height = (this.header_height + delta).max(px(40.0));
+                        }
+                        // Dragging down shrinks the comments panel below the divider.
+                        ResizeSection::Comments => {
+                            this.comments_height = (this.comments_height - delta).max(px(80.0));
+                        }
+                    }
+                    this.section_resize = Some((section, event.position.y));
+                    cx.notify();
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                        if this.section_resize.take().is_some() {
+                            cx.notify();
+                        }
+                    }),
+                )
+        });
 
         v_flex()
             .id("review-thread")
             .size_full()
+            .relative()
             .child(
                 h_flex()
                     .flex_none()
@@ -1868,8 +1958,17 @@ impl Render for ReviewView {
                             .color(Color::Muted),
                     ),
             )
-            .child(self.render_metadata(window, cx))
+            .child(
+                div()
+                    .flex_none()
+                    .h(self.header_height)
+                    .w_full()
+                    .overflow_hidden()
+                    .child(self.render_metadata(window, cx)),
+            )
+            .child(header_divider)
             .child(files_panel)
+            .child(comments_divider)
             .child(comments_panel)
             .child(
                 v_flex()
@@ -1908,5 +2007,6 @@ impl Render for ReviewView {
                             }),
                     ),
             )
+            .children(resize_overlay)
     }
 }
