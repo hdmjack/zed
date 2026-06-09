@@ -175,7 +175,7 @@ fn label_color(hex: &str) -> Color {
 
 /// Format a GitHub ISO-8601 timestamp as a relative string (e.g. "3 days ago"),
 /// matching git blame's relative timestamps. Falls back to the raw string.
-fn format_pr_date(iso: &str) -> String {
+pub(crate) fn format_pr_date(iso: &str) -> String {
     use time::format_description::well_known::Rfc3339;
     match time::OffsetDateTime::parse(iso, &Rfc3339) {
         Ok(timestamp) => {
@@ -1953,9 +1953,14 @@ impl Render for ReviewView {
                         ),
                     )
                     .child(
-                        Label::new(format!("by {} · {} files", pr_author, file_count))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        Label::new(format!(
+                            "by {} · {} {}",
+                            pr_author,
+                            file_count,
+                            if file_count == 1 { "file" } else { "files" }
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
                     ),
             )
             .child(

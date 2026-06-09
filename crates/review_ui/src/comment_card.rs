@@ -1,7 +1,7 @@
 use crate::review_provider::ReviewComment;
 use gpui::{Entity, TextStyleRefinement, px};
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
-use ui::{Color, IntoElement, Label, LabelSize, div, h_flex, prelude::*, v_flex};
+use ui::{Color, IntoElement, Label, LabelSize, Tooltip, div, h_flex, prelude::*, v_flex};
 
 #[derive(IntoElement)]
 pub struct CommentCard {
@@ -104,13 +104,23 @@ impl RenderOnce for CommentCard {
                         )
                     })
                     .child(
-                        Label::new(self.comment.created_at.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        div()
+                            .id(("comment-time", self.comment.id as usize))
+                            .flex_none()
+                            .tooltip(Tooltip::text(self.comment.created_at.clone()))
+                            .child(
+                                Label::new(crate::review_view::format_pr_date(
+                                    &self.comment.created_at,
+                                ))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                            ),
                     ),
             );
 
-        if let Some(hunk) = &self.comment.diff_hunk {
+        // Only the root comment of a thread shows the anchored diff hunk; replies
+        // would otherwise repeat the same hunk, making threads tall and noisy.
+        if let Some(hunk) = self.comment.diff_hunk.as_ref().filter(|_| !is_reply) {
             card = card.child(
                 v_flex()
                     .rounded_md()

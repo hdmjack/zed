@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
 use ui::{
     Button, ButtonStyle, Color, ContextMenu, FluentBuilder, IconName, IntoElement, Label,
-    LabelSize, PopoverMenu, div, h_flex, prelude::*, v_flex,
+    LabelSize, PopoverMenu, Tooltip, div, h_flex, prelude::*, v_flex,
 };
 
 #[derive(Clone, Debug)]
@@ -252,9 +252,15 @@ pub fn render_pr_comment_block(
                             .color(Color::Default),
                     )
                     .child(
-                        Label::new(comment.created_at.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        div()
+                            .id(("inline-comment-time", comment.id as usize))
+                            .flex_none()
+                            .tooltip(Tooltip::text(comment.created_at.clone()))
+                            .child(
+                                Label::new(crate::review_view::format_pr_date(&comment.created_at))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
                     ),
             )
             .child(

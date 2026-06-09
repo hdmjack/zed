@@ -389,10 +389,21 @@ impl PullRequestList {
                             .items_center()
                             .overflow_x_hidden()
                             .child(
-                                Label::new(format!("by {} · {}", author, updated))
+                                Label::new(format!("by {} ·", author))
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted)
                                     .single_line(),
+                            )
+                            .child(
+                                div()
+                                    .id(("pr-updated", number as usize))
+                                    .flex_none()
+                                    .tooltip(Tooltip::text(updated.clone()))
+                                    .child(
+                                        Label::new(crate::review_view::format_pr_date(&updated))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
                             )
                             .children(label_pills.into_iter().map(|(name, color)| {
                                 div()
