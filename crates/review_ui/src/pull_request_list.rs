@@ -8,7 +8,7 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    Avatar, Color, CommonAnimationExt, ContextMenu, Icon, IconButton, IconName, IconSize,
+    Avatar, Color, CommonAnimationExt, ContextMenu, Facepile, Icon, IconButton, IconName, IconSize,
     IntoElement, Label, LabelSize, PopoverMenuHandle, Tooltip, div, h_flex, prelude::*, v_flex,
 };
 use ui::PopoverMenu;
@@ -262,6 +262,7 @@ impl PullRequestList {
         let updated = pr.updated_at.clone();
         let is_draft = pr.is_draft;
         let comment_count = pr.comment_count;
+        let participants = pr.participants.clone();
 
         let checks_icon = pr.checks.map(|rollup| {
             let (icon, color, tip) = match rollup {
@@ -316,6 +317,25 @@ impl PullRequestList {
             .map(|l| (l.name.clone(), label_hsla(&l.color)))
             .collect();
 
+        let reviewer_facepile = (!participants.is_empty()).then(|| {
+            div()
+                .id(("pr-reviewers", number as usize))
+                .flex_none()
+                .tooltip(Tooltip::text(format!(
+                    "Participants: {}",
+                    participants.join(", ")
+                )))
+                .child(Facepile::new(
+                    participants
+                        .iter()
+                        .map(|login| {
+                            Avatar::new(crate::review_view::avatar_url(login))
+                                .size(px(14.0))
+                                .into_any_element()
+                        })
+                        .collect(),
+                ))
+        });
         let status_icons = h_flex()
             .flex_none()
             .gap_1()
@@ -362,7 +382,8 @@ impl PullRequestList {
                                 ),
                         ),
                 )
-            });
+            })
+            .children(reviewer_facepile);
 
         h_flex()
             .id(SharedString::from(format!("pr_{}", number)))

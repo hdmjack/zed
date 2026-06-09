@@ -160,6 +160,7 @@ fn map_pull_request(pr: GhPullRequest) -> PullRequestInfo {
         approvals: 0,
         required_approvals: None,
         comment_count: 0,
+        participants: Vec::new(),
     }
 }
 
@@ -249,14 +250,40 @@ struct GqlPullRequest {
     commits: Option<GqlCommits>,
     latest_opinionated_reviews: Option<GqlReviewNodes>,
     base_ref: Option<GqlBaseRef>,
-    comments: Option<GqlTotalCount>,
-    review_threads: Option<GqlTotalCount>,
+    comments: Option<GqlComments>,
+    review_threads: Option<GqlReviewThreads>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GqlTotalCount {
+struct GqlComments {
     total_count: u32,
+    #[serde(default)]
+    nodes: Vec<GqlCommentNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlReviewThreads {
+    total_count: u32,
+    #[serde(default)]
+    nodes: Vec<GqlReviewThreadNode>,
+}
+
+#[derive(Deserialize)]
+struct GqlReviewThreadNode {
+    comments: Option<GqlReviewThreadComments>,
+}
+
+#[derive(Deserialize)]
+struct GqlReviewThreadComments {
+    #[serde(default)]
+    nodes: Vec<GqlCommentNode>,
+}
+
+#[derive(Deserialize)]
+struct GqlCommentNode {
+    author: Option<GqlAuthor>,
 }
 
 #[derive(Deserialize)]
@@ -267,6 +294,7 @@ struct GqlReviewNodes {
 #[derive(Deserialize)]
 struct GqlReviewState {
     state: String,
+    author: Option<GqlAuthor>,
 }
 
 #[derive(Deserialize)]
@@ -476,6 +504,41 @@ fn map_review_decision(decision: Option<&str>) -> ReviewStatus {
 }
 
 fn map_graphql_pr(pr: GqlPullRequest) -> PullRequestInfo {
+    let review_nodes = pr
+        .latest_opinionated_reviews
+        .map(|reviews| reviews.nodes)
+        .unwrap_or_default();
+    let approvals = review_nodes
+        .iter()
+        .filter(|review| review.state == "APPROVED")
+        .count() as u32;
+    // Participants: anyone who reviewed, left a conversation comment, or
+    // participated in a review thread (inline comment).
+    let comment_authors = pr
+        .comments
+        .as_ref()
+        .map(|comments| comments.nodes.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|node| node.author.as_ref());
+    let thread_authors = pr
+        .review_threads
+        .as_ref()
+        .map(|threads| threads.nodes.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|thread| thread.comments.as_ref())
+        .flat_map(|comments| comments.nodes.iter())
+        .filter_map(|node| node.author.as_ref());
+    let review_authors = review_nodes.iter().filter_map(|node| node.author.as_ref());
+    let mut participants: Vec<SharedString> = Vec::new();
+    for author in review_authors.chain(comment_authors).chain(thread_authors) {
+        let login = SharedString::from(author.login.clone());
+        if !participants.contains(&login) {
+            participants.push(login);
+        }
+    }
+
     PullRequestInfo {
         number: pr.number,
         node_id: pr.id.into(),
@@ -512,22 +575,14 @@ fn map_graphql_pr(pr: GqlPullRequest) -> PullRequestInfo {
                     .collect()
             })
             .unwrap_or_default(),
-        approvals: pr
-            .latest_opinionated_reviews
-            .map(|reviews| {
-                reviews
-                    .nodes
-                    .iter()
-                    .filter(|review| review.state == "APPROVED")
-                    .count() as u32
-            })
-            .unwrap_or(0),
+        approvals,
         required_approvals: pr
             .base_ref
             .and_then(|base_ref| base_ref.branch_protection_rule)
             .and_then(|rule| rule.required_approving_review_count),
         comment_count: pr.comments.map_or(0, |c| c.total_count)
             + pr.review_threads.map_or(0, |t| t.total_count),
+        participants,
     }
 }
 
@@ -570,10 +625,10 @@ impl ReviewProvider for GitHubProvider {
                      mergeable \
                      labels(first: 10) {{ nodes {{ name color }} }} \
                      commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} \
-                     latestOpinionatedReviews(first: 50) {{ nodes {{ state }} }} \
+                     latestOpinionatedReviews(first: 50) {{ nodes {{ state author {{ login }} }} }} \
                      baseRef {{ branchProtectionRule {{ requiredApprovingReviewCount }} }} \
-                     comments {{ totalCount }} \
-                     reviewThreads {{ totalCount }} \
+                     comments(first: 50) {{ totalCount nodes {{ author {{ login }} }} }} \
+                     reviewThreads(first: 50) {{ totalCount nodes {{ comments(first: 20) {{ nodes {{ author {{ login }} }} }} }} }} \
                    }} \
                  }} \
                }} \

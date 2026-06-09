@@ -242,6 +242,8 @@ pub struct PullRequestInfo {
     /// Combined conversation comments + inline review threads, for a list-row
     /// activity indicator.
     pub comment_count: u32,
+    /// Distinct logins of everyone who reviewed or commented (for a facepile).
+    pub participants: Vec<SharedString>,
 }
 
 pub trait ReviewProvider: Send + Sync {

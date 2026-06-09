@@ -18,7 +18,7 @@ use gpui::{
 use std::sync::Arc;
 use ui::{
     Avatar, Button, ButtonLike, ButtonSize, Checkbox, Color, ContextMenu, DiffStat, ElevationIndex,
-    Icon, IconButton,
+    Facepile, Icon, IconButton,
     IconName, IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, SplitButton,
     ToggleState, Tooltip, div, h_flex, prelude::*, v_flex,
 };
@@ -1998,7 +1998,28 @@ impl Render for ReviewView {
                                 ))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
-                            ),
+                            )
+                            .when(!self.selected_pr.participants.is_empty(), |row| {
+                                let participants = self.selected_pr.participants.clone();
+                                row.child(
+                                    div()
+                                        .id("detail-reviewers")
+                                        .tooltip(Tooltip::text(format!(
+                                            "Participants: {}",
+                                            participants.join(", ")
+                                        )))
+                                        .child(Facepile::new(
+                                            participants
+                                                .iter()
+                                                .map(|login| {
+                                                    Avatar::new(avatar_url(login))
+                                                        .size(px(16.0))
+                                                        .into_any_element()
+                                                })
+                                                .collect(),
+                                        )),
+                                )
+                            }),
                     ),
             )
             .child(
