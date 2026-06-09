@@ -393,6 +393,9 @@ impl ReviewView {
         self.pr_comments = comments;
         self.pr_comments_loading = false;
         self.rebuild(cx);
+        // The diff editor may have opened before comments finished loading (e.g.
+        // on restore), so prompt the panel to (re)inject inline blocks.
+        cx.emit(ReviewViewEvent::CommentsChanged);
         cx.notify();
     }
 

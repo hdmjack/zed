@@ -1344,11 +1344,21 @@ impl ReviewPanel {
     /// for whichever diff editor currently has them, deferred out of the click's
     /// layout pass to avoid an editor resize feedback loop.
     fn refresh_inline_comment_blocks(&mut self, cx: &mut Context<Self>) {
-        let Some(editor) = self
-            .injected_comment_blocks
-            .values()
-            .find_map(|(editor, _)| editor.upgrade())
-        else {
+        // Prefer the active diff editor (it may not have any injected blocks yet
+        // if comments hadn't loaded when it opened), falling back to whichever
+        // editor we last injected into.
+        let active_diff = self
+            ._workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).active_item(cx))
+            .and_then(|item| item.act_as::<Editor>(cx))
+            .filter(|editor| editor.read(cx).addon::<ReviewEditorAddon>().is_some());
+        let editor = active_diff.or_else(|| {
+            self.injected_comment_blocks
+                .values()
+                .find_map(|(editor, _)| editor.upgrade())
+        });
+        let Some(editor) = editor else {
             return;
         };
         let weak_self = cx.weak_entity();
