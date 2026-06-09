@@ -159,6 +159,7 @@ fn map_pull_request(pr: GhPullRequest) -> PullRequestInfo {
         labels: Vec::new(),
         approvals: 0,
         required_approvals: None,
+        comment_count: 0,
     }
 }
 
@@ -248,6 +249,14 @@ struct GqlPullRequest {
     commits: Option<GqlCommits>,
     latest_opinionated_reviews: Option<GqlReviewNodes>,
     base_ref: Option<GqlBaseRef>,
+    comments: Option<GqlTotalCount>,
+    review_threads: Option<GqlTotalCount>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlTotalCount {
+    total_count: u32,
 }
 
 #[derive(Deserialize)]
@@ -517,6 +526,8 @@ fn map_graphql_pr(pr: GqlPullRequest) -> PullRequestInfo {
             .base_ref
             .and_then(|base_ref| base_ref.branch_protection_rule)
             .and_then(|rule| rule.required_approving_review_count),
+        comment_count: pr.comments.map_or(0, |c| c.total_count)
+            + pr.review_threads.map_or(0, |t| t.total_count),
     }
 }
 
@@ -561,6 +572,8 @@ impl ReviewProvider for GitHubProvider {
                      commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} \
                      latestOpinionatedReviews(first: 50) {{ nodes {{ state }} }} \
                      baseRef {{ branchProtectionRule {{ requiredApprovingReviewCount }} }} \
+                     comments {{ totalCount }} \
+                     reviewThreads {{ totalCount }} \
                    }} \
                  }} \
                }} \

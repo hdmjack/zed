@@ -17,8 +17,8 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    Avatar, Button, ButtonLike, ButtonSize, Checkbox, Color, ContextMenu, ElevationIndex, Icon,
-    IconButton,
+    Avatar, Button, ButtonLike, ButtonSize, Checkbox, Color, ContextMenu, DiffStat, ElevationIndex,
+    Icon, IconButton,
     IconName, IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, SplitButton,
     ToggleState, Tooltip, div, h_flex, prelude::*, v_flex,
 };
@@ -1493,27 +1493,28 @@ impl ReviewView {
                                     })
                                     .single_line(),
                             )
-                            .when(additions > 0, |el| {
+                            .when(additions > 0 || deletions > 0, |el| {
                                 el.child(
-                                    Label::new(format!("+{}", additions))
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Created),
-                                )
-                            })
-                            .when(deletions > 0, |el| {
-                                el.child(
-                                    Label::new(format!("-{}", deletions))
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Deleted),
+                                    DiffStat::new(
+                                        SharedString::from(format!("diffstat-{ix}")),
+                                        additions as usize,
+                                        deletions as usize,
+                                    )
+                                    .label_size(LabelSize::XSmall),
                                 )
                             }),
                     )
                     .when(comment_count > 0, |row| {
                         row.child(
                             h_flex()
+                                .id(SharedString::from(format!("file-comments-{ix}")))
                                 .flex_none()
                                 .gap_1()
                                 .px_1()
+                                .tooltip(Tooltip::text(format!(
+                                    "{comment_count} comment{}",
+                                    if comment_count == 1 { "" } else { "s" }
+                                )))
                                 .child(
                                     Icon::new(IconName::Chat)
                                         .size(IconSize::XSmall)
@@ -1526,23 +1527,35 @@ impl ReviewView {
                                 ),
                         )
                     })
-                    .child({
-                        let weak = cx.weak_entity();
-                        Checkbox::new(
-                            SharedString::from(format!("pr_file_viewed_{}", ix)),
-                            if is_viewed {
-                                ToggleState::Selected
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("pr_file_viewed_wrap_{}", ix)))
+                            .flex_none()
+                            .tooltip(Tooltip::text(if is_viewed {
+                                "Viewed"
                             } else {
-                                ToggleState::Unselected
-                            },
-                        )
-                        .on_click_ext(move |_state, _event, _window, cx| {
-                            cx.stop_propagation();
-                            let viewed_path = viewed_path.clone();
-                            weak.update(cx, |this, cx| this.toggle_file_viewed(viewed_path, cx))
-                                .ok();
-                        })
-                    });
+                                "Mark as viewed"
+                            }))
+                            .child({
+                                let weak = cx.weak_entity();
+                                Checkbox::new(
+                                    SharedString::from(format!("pr_file_viewed_{}", ix)),
+                                    if is_viewed {
+                                        ToggleState::Selected
+                                    } else {
+                                        ToggleState::Unselected
+                                    },
+                                )
+                                .on_click_ext(move |_state, _event, _window, cx| {
+                                    cx.stop_propagation();
+                                    let viewed_path = viewed_path.clone();
+                                    weak.update(cx, |this, cx| {
+                                        this.toggle_file_viewed(viewed_path, cx)
+                                    })
+                                    .ok();
+                                })
+                            }),
+                    );
 
                 let file_row = if let Some(repo_path) = repo_path {
                     file_row.on_click(cx.listener(move |_this, _event, _window, cx| {

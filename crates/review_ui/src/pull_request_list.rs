@@ -261,6 +261,7 @@ impl PullRequestList {
         let author = pr.author.clone();
         let updated = pr.updated_at.clone();
         let is_draft = pr.is_draft;
+        let comment_count = pr.comment_count;
 
         let checks_icon = pr.checks.map(|rollup| {
             let (icon, color, tip) = match rollup {
@@ -335,7 +336,33 @@ impl PullRequestList {
             .children(
                 approval_label
                     .map(|label| Label::new(label).size(LabelSize::XSmall).color(Color::Muted)),
-            );
+            )
+            .when(comment_count > 0, |row| {
+                row.child(
+                    div()
+                        .id(("pr-comments", number as usize))
+                        .flex_none()
+                        .tooltip(Tooltip::text(format!(
+                            "{comment_count} comment{}",
+                            if comment_count == 1 { "" } else { "s" }
+                        )))
+                        .child(
+                            h_flex()
+                                .gap_0p5()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::Chat)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(comment_count.to_string())
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        ),
+                )
+            });
 
         h_flex()
             .id(SharedString::from(format!("pr_{}", number)))

@@ -239,6 +239,9 @@ pub struct PullRequestInfo {
     /// Approvals required by branch protection, if readable (None when there's
     /// no protection rule or the token can't read it).
     pub required_approvals: Option<u32>,
+    /// Combined conversation comments + inline review threads, for a list-row
+    /// activity indicator.
+    pub comment_count: u32,
 }
 
 pub trait ReviewProvider: Send + Sync {
