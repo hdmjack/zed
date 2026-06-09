@@ -1,6 +1,8 @@
 use crate::review_provider::{ReactionContent, ReviewComment};
 use editor::display_map::BlockContext;
-use gpui::{AnyElement, App, Entity, SharedString};
+use gpui::{AnyElement, App, Entity, ImageSource, SharedString};
+use regex::Regex;
+use std::sync::LazyLock;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
 use ui::{
     Button, ButtonStyle, Color, ContextMenu, FluentBuilder, IconName, IntoElement, Label,
@@ -31,6 +33,18 @@ pub fn comment_markdown(body: SharedString, cx: &mut App) -> Entity<Markdown> {
     })
 }
 
+/// Resolve a comment image URL to a remote image source. Only http(s) URLs are
+/// loaded (data: images are decoded by the markdown renderer itself); relative
+/// or other schemes are skipped. Used as the `image_resolver` for comment
+/// markdown so inline `<img>` and `<a><img></a>` badges render.
+pub fn resolve_comment_image(url: &str) -> Option<ImageSource> {
+    if url.starts_with("https://") || url.starts_with("http://") {
+        Some(ImageSource::from(url.to_string()))
+    } else {
+        None
+    }
+}
+
 /// Strip HTML noise the markdown renderer can't display inline: HTML comments
 /// (`<!-- ... -->`, often used by bots to stash metadata) and `<sub>`/`<sup>`
 /// wrappers (unwrapped to their inner text).
@@ -48,10 +62,72 @@ fn sanitize_comment_html(body: &str) -> String {
     }
     out.push_str(rest);
 
-    out.replace("<sub>", "")
+    let out = out
+        .replace("<sub>", "")
         .replace("</sub>", "")
         .replace("<sup>", "")
-        .replace("</sup>", "")
+        .replace("</sup>", "");
+
+    rewrite_html_images(&out)
+}
+
+/// Convert HTML images/badges to markdown so they render even when they appear
+/// inline (pulldown otherwise passes inline `<img>`/`<a>` through as literal
+/// text). Handles `<picture>` wrappers, bare `<img>` → `![alt](src)`, and
+/// `<a href><img></a>` → `[![alt](src)](href)`.
+fn rewrite_html_images(body: &str) -> String {
+    static PICTURE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)</?picture[^>]*>|<source\b[^>]*>").unwrap());
+    static IMG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<img\b[^>]*>").unwrap());
+    static ANCHOR_IMG: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)(<a\b[^>]*>)\s*(!\[[^\]]*\]\([^)]*\))\s*</a>").unwrap()
+    });
+
+    // Drop <picture>/<source> wrappers, keeping the inner <img>.
+    let body = PICTURE.replace_all(body, "");
+
+    // Bare <img …> → ![alt](src). Leave the tag untouched if it has no src.
+    let body = IMG.replace_all(&body, |caps: &regex::Captures| {
+        let tag = &caps[0];
+        match html_attr(tag, "src") {
+            Some(src) => format!("![{}]({})", html_attr(tag, "alt").unwrap_or_default(), src),
+            None => tag.to_string(),
+        }
+    });
+
+    // <a href><img></a> (now <a href>![alt](src)</a>) → [![alt](src)](href).
+    ANCHOR_IMG
+        .replace_all(&body, |caps: &regex::Captures| match html_attr(&caps[1], "href") {
+            Some(href) => format!("[{}]({})", &caps[2], href),
+            None => caps[2].to_string(),
+        })
+        .into_owned()
+}
+
+/// Extract an HTML attribute value (double- or single-quoted) from a tag string.
+fn html_attr(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let key = format!("{name}=");
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find(&key) {
+        let after = from + pos + key.len();
+        // Ensure the match is an attribute boundary, not a suffix of another attr.
+        let preceded_by_space = from + pos == 0
+            || tag[..from + pos]
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_whitespace());
+        let quote = tag[after..].chars().next();
+        if preceded_by_space && matches!(quote, Some('"') | Some('\'')) {
+            let quote = quote.unwrap();
+            let value_start = after + 1;
+            if let Some(end) = tag[value_start..].find(quote) {
+                return Some(tag[value_start..value_start + end].to_string());
+            }
+        }
+        from = after;
+    }
+    None
 }
 
 /// Extracts ```suggestion fenced blocks from a comment body.
@@ -137,7 +213,10 @@ pub fn render_pr_comment_block(
                             .color(Color::Muted),
                     ),
             )
-            .child(MarkdownElement::new(markdown_entity.clone(), style.clone()));
+            .child(
+                MarkdownElement::new(markdown_entity.clone(), style.clone())
+                    .image_resolver(resolve_comment_image),
+            );
 
         for suggestion in suggestions {
             row = row.child(render_suggestion_block(suggestion, comment.id, cx));

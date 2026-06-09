@@ -41,6 +41,7 @@ serde_json.workspace = true
 futures.workspace = true
 git_hosting_providers.workspace = true
 markdown.workspace = true
+regex.workspace = true
 text.workspace = true
 time.workspace = true
 time_format.workspace = true

@@ -150,7 +150,10 @@ impl RenderOnce for CommentCard {
                 // Markdown text runs inherit the ambient text size (TextRun carries
                 // no font size of its own), so set it on the container.
                 .text_size(px(12.0))
-                .child(MarkdownElement::new(self.body, markdown_style)),
+                .child(
+                    MarkdownElement::new(self.body, markdown_style)
+                        .image_resolver(crate::inline_comment::resolve_comment_image),
+                ),
         );
 
         if let Some(bar) = crate::inline_comment::reaction_bar(&self.comment, "card", cx) {

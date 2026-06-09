@@ -623,7 +623,10 @@ impl ReviewView {
                         .max_h(max_height)
                         .overflow_y_scroll()
                         .text_size(px(11.0))
-                        .child(MarkdownElement::new(description, style)),
+                        .child(
+                            MarkdownElement::new(description, style)
+                                .image_resolver(crate::inline_comment::resolve_comment_image),
+                        ),
                 );
             }
         }
