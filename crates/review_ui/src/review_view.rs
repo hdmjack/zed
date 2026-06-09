@@ -1141,7 +1141,9 @@ impl ReviewView {
                     Label::new(label).size(LabelSize::Small).color(if disabled {
                         Color::Disabled
                     } else {
-                        Color::Default
+                        // Accent makes Merge the visually primary action,
+                        // outweighing the neutral Comment button beside it.
+                        Color::Accent
                     }),
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
@@ -1950,43 +1952,53 @@ impl Render for ReviewView {
             .size_full()
             .relative()
             .child(
-                h_flex()
+                v_flex()
                     .flex_none()
                     .px_2()
                     .py_1()
-                    .gap_1()
-                    .items_center()
+                    .gap_0p5()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
                     .child(
-                        IconButton::new("back-to-pr-list", IconName::ArrowLeft)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Back to PR list"))
-                            .on_click(cx.listener(|_this, _, _window, cx| {
-                                cx.emit(ReviewViewEvent::Back);
-                            })),
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                IconButton::new("back-to-pr-list", IconName::ArrowLeft)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Back to PR list"))
+                                    .on_click(cx.listener(|_this, _, _window, cx| {
+                                        cx.emit(ReviewViewEvent::Back);
+                                    })),
+                            )
+                            .child(
+                                Label::new(format!("#{}", pr_number))
+                                    .size(LabelSize::Large)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                div().overflow_x_hidden().flex_1().child(
+                                    Label::new(pr_title.to_string())
+                                        .size(LabelSize::Large)
+                                        .single_line(),
+                                ),
+                            ),
                     )
                     .child(
-                        Label::new(format!("#{}", pr_number))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        div().overflow_x_hidden().flex_1().child(
-                            Label::new(pr_title.to_string())
-                                .size(LabelSize::Small)
-                                .single_line(),
-                        ),
-                    )
-                    .child(
-                        Label::new(format!(
-                            "by {} · {} {}",
-                            pr_author,
-                            file_count,
-                            if file_count == 1 { "file" } else { "files" }
-                        ))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(Avatar::new(avatar_url(&pr_author)).size(px(16.0)))
+                            .child(
+                                Label::new(format!(
+                                    "{} · {} {}",
+                                    pr_author,
+                                    file_count,
+                                    if file_count == 1 { "file" } else { "files" }
+                                ))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                            ),
                     ),
             )
             .child(
@@ -2010,9 +2022,14 @@ impl Render for ReviewView {
                     .child(
                         div()
                             .id("comment-editor-container")
+                            .mx_2()
+                            .mt_2()
                             .px_2()
-                            .pt_2()
-                            .w_full()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(cx.theme().colors().border)
+                            .bg(cx.theme().colors().element_background)
                             .cursor_text()
                             .on_click(cx.listener(|this, _, window, cx| {
                                 window.focus(&this.comment_editor.focus_handle(cx), cx);
