@@ -1,11 +1,11 @@
 use crate::review_provider::{ReactionContent, ReviewComment};
 use editor::display_map::BlockContext;
-use gpui::{AnyElement, App, Entity, ImageSource, SharedString};
+use gpui::{AnyElement, App, Entity, ImageSource, SharedString, px};
 use regex::Regex;
 use std::sync::LazyLock;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
 use ui::{
-    Button, ButtonStyle, Color, ContextMenu, FluentBuilder, IconName, IntoElement, Label,
+    Avatar, Button, ButtonStyle, Color, ContextMenu, FluentBuilder, IconName, IntoElement, Label,
     LabelSize, PopoverMenu, Tooltip, div, h_flex, prelude::*, v_flex,
 };
 
@@ -244,8 +244,11 @@ pub fn render_pr_comment_block(
             })
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_1p5()
                     .items_center()
+                    .child(
+                        Avatar::new(crate::review_view::avatar_url(&comment.author)).size(px(16.0)),
+                    )
                     .child(
                         Label::new(comment.author.clone())
                             .size(LabelSize::XSmall)

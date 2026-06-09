@@ -1,7 +1,7 @@
 use crate::review_provider::ReviewComment;
 use gpui::{Entity, TextStyleRefinement, px};
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
-use ui::{Color, IntoElement, Label, LabelSize, Tooltip, div, h_flex, prelude::*, v_flex};
+use ui::{Avatar, Color, IntoElement, Label, LabelSize, Tooltip, div, h_flex, prelude::*, v_flex};
 
 #[derive(IntoElement)]
 pub struct CommentCard {
@@ -32,7 +32,9 @@ impl CommentPreview {
 impl RenderOnce for CommentPreview {
     fn render(self, window: &mut gpui::Window, cx: &mut gpui::App) -> impl IntoElement {
         let mut style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
-        style.base_text_style.color = cx.theme().colors().text_muted;
+        // The comment body is the primary content in collapsed rows, so render it
+        // in the default text color (the author handle is the muted secondary).
+        style.base_text_style.color = cx.theme().colors().text;
         // Skip the paragraph's bottom margin / tall line-height so the single
         // line sits flush in the clipped row.
         style.height_is_multiple_of_line_height = true;
@@ -89,8 +91,12 @@ impl RenderOnce for CommentCard {
             })
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_1p5()
                     .items_center()
+                    .child(
+                        Avatar::new(crate::review_view::avatar_url(&self.comment.author))
+                            .size(px(16.0)),
+                    )
                     .child(
                         Label::new(self.comment.author.clone())
                             .size(LabelSize::XSmall)

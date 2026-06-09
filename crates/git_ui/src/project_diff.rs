@@ -1019,6 +1019,16 @@ impl ProjectDiff {
     }
 }
 
+/// Abbreviate a full 40-char hex SHA to its short form for display; leave
+/// branch names and already-short refs untouched.
+fn short_git_ref(reference: &str) -> &str {
+    if reference.len() == 40 && reference.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        &reference[..7]
+    } else {
+        reference
+    }
+}
+
 fn sort_prefix(repo: &Repository, repo_path: &RepoPath, status: FileStatus, cx: &App) -> u64 {
     let settings = GitPanelSettings::get_global(cx);
 
@@ -1097,7 +1107,9 @@ impl Item for ProjectDiff {
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
         match self.branch_diff.read(cx).diff_base() {
             DiffBase::Head => "Uncommitted Changes".into(),
-            DiffBase::Merge { base_ref, .. } => format!("Changes since {}", base_ref).into(),
+            DiffBase::Merge { base_ref, .. } => {
+                format!("Changes since {}", short_git_ref(&base_ref)).into()
+            }
         }
     }
 

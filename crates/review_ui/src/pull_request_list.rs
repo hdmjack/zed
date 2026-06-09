@@ -8,8 +8,8 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    Color, CommonAnimationExt, ContextMenu, Icon, IconButton, IconName, IconSize, IntoElement,
-    Label, LabelSize, PopoverMenuHandle, Tooltip, div, h_flex, prelude::*, v_flex,
+    Avatar, Color, CommonAnimationExt, ContextMenu, Icon, IconButton, IconName, IconSize,
+    IntoElement, Label, LabelSize, PopoverMenuHandle, Tooltip, div, h_flex, prelude::*, v_flex,
 };
 use ui::PopoverMenu;
 
@@ -346,11 +346,7 @@ impl PullRequestList {
             .rounded_md()
             .cursor_pointer()
             .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-            .child(
-                Label::new(format!("#{}", number))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
+            .child(Avatar::new(crate::review_view::avatar_url(&author)).size(px(18.0)))
             .child(
                 v_flex()
                     .flex_1()
@@ -389,7 +385,7 @@ impl PullRequestList {
                             .items_center()
                             .overflow_x_hidden()
                             .child(
-                                Label::new(format!("by {} ·", author))
+                                Label::new(format!("#{} · {} ·", number, author))
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted)
                                     .single_line(),
@@ -408,11 +404,10 @@ impl PullRequestList {
                             .children(label_pills.into_iter().map(|(name, color)| {
                                 div()
                                     .flex_none()
-                                    .px_0p5()
+                                    .px_1()
                                     .rounded_sm()
-                                    .border_1()
-                                    .border_color(color)
-                                    .text_size(px(9.0))
+                                    .bg(color.opacity(0.15))
+                                    .text_size(px(10.0))
                                     .text_color(color)
                                     .child(name)
                             }))

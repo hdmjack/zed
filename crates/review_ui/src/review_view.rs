@@ -17,7 +17,8 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    Button, ButtonLike, ButtonSize, Checkbox, Color, ContextMenu, ElevationIndex, Icon, IconButton,
+    Avatar, Button, ButtonLike, ButtonSize, Checkbox, Color, ContextMenu, ElevationIndex, Icon,
+    IconButton,
     IconName, IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, SplitButton,
     ToggleState, Tooltip, div, h_flex, prelude::*, v_flex,
 };
@@ -166,15 +167,21 @@ enum RowKind {
 
 impl EventEmitter<ReviewViewEvent> for ReviewView {}
 
-/// Parse a GitHub label hex color (e.g. "1d76db") into a UI color.
-fn label_color(hex: &str) -> Color {
+/// Parse a GitHub label hex color (e.g. "1d76db") into an Hsla.
+fn label_hsla(hex: &str) -> gpui::Hsla {
     u32::from_str_radix(hex.trim_start_matches('#'), 16)
-        .map(|rgb| Color::Custom(gpui::rgb(rgb).into()))
-        .unwrap_or(Color::Muted)
+        .map(|rgb| gpui::rgb(rgb).into())
+        .unwrap_or_else(|_| gpui::rgb(0x808080).into())
 }
 
 /// Format a GitHub ISO-8601 timestamp as a relative string (e.g. "3 days ago"),
 /// matching git blame's relative timestamps. Falls back to the raw string.
+/// GitHub serves a user's avatar at `github.com/{login}.png` (redirects to the
+/// CDN), so we can derive the URL from the login without an extra fetch.
+pub(crate) fn avatar_url(login: &str) -> String {
+    format!("https://github.com/{login}.png?size=64")
+}
+
 pub(crate) fn format_pr_date(iso: &str) -> String {
     use time::format_description::well_known::Rfc3339;
     match time::OffsetDateTime::parse(iso, &Rfc3339) {
@@ -498,15 +505,6 @@ impl ReviewView {
                 }
             });
 
-        let pill = |label: &str, color: Color, border: gpui::Hsla, bg: gpui::Hsla| {
-            div()
-                .px_1()
-                .rounded_sm()
-                .border_1()
-                .border_color(border)
-                .bg(bg)
-                .child(Label::new(label.to_string()).size(LabelSize::XSmall).color(color))
-        };
         let number = pr.number;
         let status_chip = move |suffix: &str, icon: IconName, color: Color, tip: SharedString| {
             div()
@@ -567,12 +565,15 @@ impl ReviewView {
                             .unwrap_or_default()
                             .into_iter()
                             .map(|label| {
-                                pill(
-                                    label.name.as_ref(),
-                                    label_color(&label.color),
-                                    colors.border_variant,
-                                    colors.element_background,
-                                )
+                                let hsla = label_hsla(&label.color);
+                                div()
+                                    .flex_none()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(hsla.opacity(0.15))
+                                    .text_size(px(10.0))
+                                    .text_color(hsla)
+                                    .child(label.name)
                             }),
                     ),
             );
@@ -1099,21 +1100,29 @@ impl ReviewView {
         .detach_and_log_err(cx);
     }
 
+    /// Reason the PR can't be merged right now (None when mergeable). Shown both
+    /// as the disabled merge button's tooltip and as a visible status line.
+    fn merge_blocked_reason(&self) -> Option<SharedString> {
+        if self.merging {
+            return None;
+        }
+        if let Some(error) = &self.merge_error {
+            return Some(error.clone());
+        }
+        if matches!(self.selected_pr.review_status, ReviewStatus::ChangesRequested) {
+            return Some("Changes have been requested".into());
+        }
+        if !matches!(self.selected_pr.review_status, ReviewStatus::Approved) {
+            return Some("Required approvals are pending".into());
+        }
+        if self.status.as_ref().and_then(|s| s.mergeable) != Some(true) {
+            return Some("This branch has conflicts or pending checks".into());
+        }
+        None
+    }
+
     fn render_merge_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Reason the PR can't be merged right now (also the disabled tooltip).
-        let reason: Option<SharedString> = if self.merging {
-            None
-        } else if let Some(error) = &self.merge_error {
-            Some(error.clone())
-        } else if matches!(self.selected_pr.review_status, ReviewStatus::ChangesRequested) {
-            Some("Changes have been requested".into())
-        } else if !matches!(self.selected_pr.review_status, ReviewStatus::Approved) {
-            Some("Required approvals are pending".into())
-        } else if self.status.as_ref().and_then(|s| s.mergeable) != Some(true) {
-            Some("This branch has conflicts or pending checks".into())
-        } else {
-            None
-        };
+        let reason = self.merge_blocked_reason();
         let disabled = self.merging || reason.is_some();
         let label = if self.merging {
             "Merging…"
@@ -1574,9 +1583,12 @@ impl ReviewView {
                                 .color(Color::Muted),
                         )
                         .child(
-                            Label::new(format!("@{}", comment.author))
+                            Avatar::new(avatar_url(&comment.author)).size(px(14.0)),
+                        )
+                        .child(
+                            Label::new(comment.author.clone())
                                 .size(LabelSize::XSmall)
-                                .color(Color::Default),
+                                .color(Color::Muted),
                         )
                         .child(
                             div()
@@ -1741,10 +1753,11 @@ impl ReviewView {
                                 .size(IconSize::XSmall)
                                 .color(Color::Muted),
                         )
+                        .child(Avatar::new(avatar_url(&comment.author)).size(px(14.0)))
                         .child(
-                            Label::new(format!("@{}", comment.author))
+                            Label::new(comment.author.clone())
                                 .size(LabelSize::XSmall)
-                                .color(Color::Default),
+                                .color(Color::Muted),
                         )
                         .child(
                             div()
@@ -1999,6 +2012,17 @@ impl Render for ReviewView {
                             .py_1()
                             .justify_end()
                             .gap_2()
+                            .when(!self.merged, |row| {
+                                row.when_some(self.merge_blocked_reason(), |row, reason| {
+                                    row.child(
+                                        div().flex_1().min_w_0().child(
+                                            Label::new(reason)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Warning),
+                                        ),
+                                    )
+                                })
+                            })
                             .child(self.render_review_action_button(cx))
                             .when(self.merged, |row| {
                                 row.child(
