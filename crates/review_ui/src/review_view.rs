@@ -17,7 +17,7 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    Avatar, Button, ButtonLike, ButtonSize, Checkbox, Color, ContextMenu, DiffStat, ElevationIndex,
+    Avatar, ButtonLike, ButtonSize, Checkbox, Color, ContextMenu, DiffStat, ElevationIndex,
     Facepile, Icon, IconButton,
     IconName, IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, SplitButton,
     ToggleState, Tooltip, div, h_flex, prelude::*, v_flex,
@@ -32,6 +32,9 @@ enum ResizeSection {
 
 pub enum ReviewViewEvent {
     OpenFileDiff(RepoPath),
+    /// Open (if needed) the file diff and scroll the editor to a line-anchored
+    /// comment thread, which renders inline there.
+    NavigateToComment { path: RepoPath, line: u32 },
     Back,
     /// Loaded comment data changed (reactions merged/toggled); any injected
     /// inline comment blocks should be re-rendered.
@@ -81,12 +84,6 @@ pub struct ReviewView {
     tree_diff: Option<TreeDiff>,
     comment_editor: Entity<Editor>,
     comment_submitting: bool,
-    /// Editor for the inline reply composer; shown under the thread identified
-    /// by `replying_to`.
-    reply_editor: Entity<Editor>,
-    /// Root comment id whose thread currently has an open reply composer.
-    replying_to: Option<u64>,
-    reply_submitting: bool,
     review_action: ReviewStatus,
     review_action_menu_handle: PopoverMenuHandle<ContextMenu>,
     merge_method: MergeMethod,
@@ -137,15 +134,15 @@ enum RowKind {
         comment_count: usize,
         viewed: bool,
     },
+    /// A line-anchored comment thread. In the sidebar these act purely as
+    /// navigators (one row per thread root) — the full conversation lives inline
+    /// in the diff editor, so clicking scrolls there rather than expanding here.
     Comment {
         comment: ReviewComment,
-        /// Full-body markdown, built only when the thread is expanded to avoid
-        /// holding parsed markdown for every (collapsed) comment.
-        body: Option<Entity<Markdown>>,
         /// Markdown for the one-line collapsed preview.
         preview: Entity<Markdown>,
-        depth: usize,
-        expanded: bool,
+        /// Number of replies under this thread root, surfaced as a count.
+        reply_count: usize,
     },
     /// Header above a file's comment threads in the comments panel.
     CommentFileHeader {
@@ -231,16 +228,6 @@ impl ReviewView {
             editor
         });
 
-        let reply_editor = cx.new(|cx| {
-            let mut editor = Editor::auto_height(2, 6, window, cx);
-            editor.set_placeholder_text("Reply…", window, cx);
-            editor.set_show_gutter(false, cx);
-            editor.set_show_wrap_guides(false, cx);
-            editor.set_show_indent_guides(false, cx);
-            editor.set_use_autoclose(false);
-            editor
-        });
-
         let pr_number = pull_request.number;
         let mut this = Self {
             provider,
@@ -256,9 +243,6 @@ impl ReviewView {
             tree_diff: None,
             comment_editor,
             comment_submitting: false,
-            reply_editor,
-            replying_to: None,
-            reply_submitting: false,
             review_action: ReviewStatus::Commented,
             review_action_menu_handle: PopoverMenuHandle::default(),
             merge_method: MergeMethod::Merge,
@@ -753,23 +737,24 @@ impl ReviewView {
                 path: path.clone(),
                 count: comments.len(),
             });
+            // Anchored comments are navigators: show one row per thread root with
+            // its reply count; the full conversation renders inline in the editor.
             for comment in comments {
-                // Expansion is per-thread: a reply follows its root's state, so
-                // opening the root opens the whole thread.
-                let thread_id = comment.reply_to.unwrap_or(comment.id);
-                let expanded = self.expanded_comments.contains(&thread_id);
-                let body = expanded
-                    .then(|| crate::inline_comment::comment_markdown(comment.body.clone(), cx));
+                if comment.reply_to.is_some() {
+                    continue;
+                }
+                let reply_count = comments
+                    .iter()
+                    .filter(|reply| reply.reply_to == Some(comment.id))
+                    .count();
                 let preview = crate::inline_comment::comment_markdown(
                     preview_source(&comment.body).into(),
                     cx,
                 );
                 comment_rows.push(RowKind::Comment {
                     comment: comment.clone(),
-                    body,
                     preview,
-                    depth: 0,
-                    expanded,
+                    reply_count,
                 });
             }
         }
@@ -1199,92 +1184,6 @@ impl ReviewView {
             })
     }
 
-    fn submit_reply(&mut self, parent_id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(provider) = self.provider.clone() else {
-            return;
-        };
-        let Some(owner) = self.remote_owner.clone() else {
-            return;
-        };
-        let Some(repo) = self.remote_repo.clone() else {
-            return;
-        };
-
-        let body = self.reply_editor.read(cx).text(cx);
-        if body.trim().is_empty() {
-            return;
-        }
-        let pr_number = self.selected_pr.number;
-        self.reply_submitting = true;
-        cx.notify();
-
-        cx.spawn_in(window, async move |this, cx| {
-            let new_comment = provider
-                .reply_to_comment(&owner, &repo, pr_number, &body, parent_id)
-                .await?;
-            this.update_in(cx, |this, window, cx| {
-                this.pr_comments.push(new_comment);
-                this.reply_submitting = false;
-                this.replying_to = None;
-                this.reply_editor.update(cx, |editor, cx| {
-                    editor.clear(window, cx);
-                });
-                this.rebuild(cx);
-                cx.notify();
-            })?;
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
-    }
-
-    fn render_reply_composer(&self, parent_id: u64, cx: &mut Context<Self>) -> impl IntoElement {
-        let submitting = self.reply_submitting;
-        v_flex()
-            .mt_1()
-            .gap_1()
-            .child(
-                div()
-                    .id("reply-editor-container")
-                    .px_2()
-                    .pt_1()
-                    .w_full()
-                    .cursor_text()
-                    .border_1()
-                    .border_color(cx.theme().colors().border)
-                    .rounded_md()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        window.focus(&this.reply_editor.focus_handle(cx), cx);
-                    }))
-                    .child(self.reply_editor.clone()),
-            )
-            .child(
-                h_flex()
-                    .justify_end()
-                    .gap_1()
-                    .child(
-                        Button::new("reply-cancel", "Cancel")
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.replying_to = None;
-                                this.reply_editor.update(cx, |editor, cx| {
-                                    editor.clear(window, cx);
-                                });
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("reply-submit", "Reply")
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Small)
-                            .disabled(submitting)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.submit_reply(parent_id, window, cx);
-                            })),
-                    ),
-            )
-    }
-
     fn review_action_label(&self) -> &'static str {
         match &self.review_action {
             ReviewStatus::Commented => "Comment",
@@ -1570,103 +1469,70 @@ impl ReviewView {
             }
             RowKind::Comment {
                 comment,
-                body,
                 preview,
-                depth,
-                expanded,
+                reply_count,
             } => {
-                let indent = *depth as f32 * TREE_INDENT + 8.0;
                 let comment_id = comment.id;
-                let is_root = comment.reply_to.is_none();
-                let is_reply = !is_root;
-                // Toggling any row in a thread toggles the whole thread.
-                let thread_id = comment.reply_to.unwrap_or(comment_id);
-
-                if !*expanded {
-                    return h_flex()
-                        .id(SharedString::from(format!("comment-{comment_id}")))
-                        .pl(px(if is_reply { indent + 16.0 } else { indent }))
-                        .pr_2()
-                        .py_1()
-                        .gap_1()
-                        .items_center()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                        .child(
-                            Icon::new(IconName::ChevronRight)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Avatar::new(avatar_url(&comment.author)).size(px(14.0)),
-                        )
-                        .child(
-                            Label::new(comment.author.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_x_hidden()
-                                .child(CommentPreview::new(preview.clone())),
-                        )
-                        .on_click(cx.listener(move |this, _, _window, cx| {
-                            this.toggle_comment(thread_id, cx);
-                        }))
-                        .into_any_element();
-                }
-
-                let is_replying = self.replying_to == Some(comment_id);
-                let mut container = v_flex()
-                    .min_w_0()
-                    .pl(px(indent))
+                // Navigate to where the thread renders inline in the diff editor.
+                let nav_target = comment
+                    .path
+                    .as_deref()
+                    .and_then(|path| RepoPath::new(path).ok())
+                    .zip(comment.line);
+                let reply_count = *reply_count;
+                let mut row = h_flex()
+                    .id(SharedString::from(format!("comment-{comment_id}")))
+                    .pl(px(8.0))
                     .pr_2()
+                    .py_1()
                     .gap_1()
+                    .items_center()
+                    .when(nav_target.is_some(), |row| {
+                        row.cursor_pointer()
+                            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                    })
+                    .child(Avatar::new(avatar_url(&comment.author)).size(px(14.0)))
                     .child(
+                        Label::new(comment.author.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_x_hidden()
+                            .child(CommentPreview::new(preview.clone())),
+                    );
+                if reply_count > 0 {
+                    row = row.child(
                         h_flex()
-                            .id(SharedString::from(format!("comment-hdr-{comment_id}")))
-                            .px_2()
-                            .gap_1()
+                            .flex_none()
+                            .gap_0p5()
                             .items_center()
-                            .cursor_pointer()
                             .child(
-                                Icon::new(IconName::ChevronDown)
+                                Icon::new(IconName::ReplyArrowRight)
                                     .size(IconSize::XSmall)
                                     .color(Color::Muted),
                             )
                             .child(
-                                Label::new(format!("@{}", comment.author))
+                                Label::new(reply_count.to_string())
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted),
-                            )
-                            .on_click(cx.listener(move |this, _, _window, cx| {
-                                this.toggle_comment(thread_id, cx);
-                            })),
-                    )
-                    .child(CommentCard::new(comment.clone(), body.clone().unwrap_or_else(|| preview.clone())));
-                if is_root && !is_replying {
-                    container = container.child(
-                        h_flex().pl_2().child(
-                            Button::new(
-                                SharedString::from(format!("reply-{comment_id}")),
-                                "Reply",
-                            )
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.replying_to = Some(comment_id);
-                                window.focus(&this.reply_editor.focus_handle(cx), cx);
-                                cx.notify();
-                            })),
-                        ),
+                            ),
                     );
                 }
-                if is_replying {
-                    container = container.child(self.render_reply_composer(comment_id, cx));
+                if let Some((path, line)) = nav_target {
+                    row = row
+                        .tooltip(Tooltip::text("Show in diff"))
+                        .on_click(cx.listener(move |_this, _, _window, cx| {
+                            cx.emit(ReviewViewEvent::NavigateToComment {
+                                path: path.clone(),
+                                line,
+                            });
+                        }));
                 }
-                container.into_any_element()
+                row.into_any_element()
             }
             RowKind::CommentFileHeader {
                 display_name,

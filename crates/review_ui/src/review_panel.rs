@@ -9,7 +9,7 @@ use markdown::Markdown;
 use anyhow::Result;
 use collections::HashMap;
 use editor::display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
-use editor::{Addon, Editor};
+use editor::{Addon, Editor, EditorEvent};
 use multi_buffer::ExcerptBoundaryInfo;
 use fs::Fs;
 use git::repository::RepoPath;
@@ -26,6 +26,7 @@ use project::{
 };
 use settings::{self, Settings};
 use std::sync::Arc;
+use std::time::Duration;
 use ui::{
     Button, ButtonSize, Checkbox, Color, ContextMenu, DynamicSpacing, IconButton, IconName,
     IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, Tab, ToggleState,
@@ -95,6 +96,10 @@ pub struct ReviewPanel {
     /// Whether the PR's diff has been auto-opened for the current selection.
     pr_diff_opened: bool,
     injected_comment_blocks: HashMap<EntityId, (WeakEntity<Editor>, Vec<CustomBlockId>)>,
+    /// Per diff-editor subscriptions used to re-inject inline comment blocks as
+    /// the merge diff loads its files incrementally (each file emits
+    /// `BufferRangesUpdated` as its excerpts are registered).
+    diff_editor_subscriptions: HashMap<EntityId, Subscription>,
     /// Open inline composers (replies and new comments). Multiple can be open at
     /// once; each is identified by `id`.
     inline_composers: Vec<InlineComposer>,
@@ -333,6 +338,7 @@ impl ReviewPanel {
             pending_action: None,
             pr_diff_opened: false,
             injected_comment_blocks: HashMap::default(),
+            diff_editor_subscriptions: HashMap::default(),
             inline_composers: Vec::new(),
             next_composer_id: 0,
             _workspace_subscription: workspace_subscription,
@@ -736,10 +742,14 @@ impl ReviewPanel {
                     ReviewViewEvent::OpenFileDiff(path) => {
                         this.open_file_diff(path.clone(), cx);
                     }
+                    ReviewViewEvent::NavigateToComment { path, line } => {
+                        this.navigate_to_comment(path.clone(), *line, window, cx);
+                    }
                     ReviewViewEvent::Back => {
                         this.selected_pr = None;
                         this.review_view = None;
                         this.remove_all_injected_blocks(cx);
+                        this.diff_editor_subscriptions.clear();
                         this.show_pull_request_list(window, cx);
                     }
                     ReviewViewEvent::CommentsChanged => {
@@ -957,6 +967,113 @@ impl ReviewPanel {
         cx.notify();
     }
 
+    /// The active (or last-injected) PR diff editor, if one is open.
+    fn pr_diff_editor(&self, cx: &App) -> Option<Entity<Editor>> {
+        self._workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).active_item(cx))
+            .and_then(|item| item.act_as::<Editor>(cx))
+            .filter(|editor| editor.read(cx).addon::<ReviewEditorAddon>().is_some())
+            .or_else(|| {
+                self.injected_comment_blocks
+                    .values()
+                    .find_map(|(editor, _)| editor.upgrade())
+            })
+    }
+
+    /// Resolve a (path, line) to a multibuffer anchor in `editor` and center the
+    /// view on it. Returns `false` when the file's excerpt isn't loaded yet (so
+    /// the caller can retry once the diff finishes loading that file).
+    fn scroll_diff_editor_to_comment(
+        editor: &Entity<Editor>,
+        path: &RepoPath,
+        line: u32,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let target_path = path.as_std_path().to_string_lossy().to_string();
+        let row = line.saturating_sub(1);
+        let focus_handle = editor.read(cx).focus_handle(cx);
+        let scrolled = editor.update(cx, |editor, cx| {
+            let multibuffer = editor.buffer().clone();
+            let snapshot = multibuffer.read(cx).snapshot(cx);
+            let anchor = multibuffer
+                .read(cx)
+                .all_buffers()
+                .into_iter()
+                .find_map(|buffer| {
+                    let buffer = buffer.read(cx);
+                    let file = buffer.file()?;
+                    let file_path = file.path().as_std_path().to_string_lossy().to_string();
+                    if file_path != target_path {
+                        return None;
+                    }
+                    let buffer_snapshot = buffer.snapshot();
+                    if row > buffer_snapshot.max_point().row {
+                        return None;
+                    }
+                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(Point::new(row, 0)))
+                });
+            let Some(anchor) = anchor else {
+                return false;
+            };
+            editor.change_selections(
+                editor::SelectionEffects::scroll(editor::scroll::Autoscroll::center()),
+                window,
+                cx,
+                |selections| selections.select_anchor_ranges([anchor..anchor]),
+            );
+            true
+        });
+        if scrolled {
+            window.focus(&focus_handle, cx);
+        }
+        scrolled
+    }
+
+    /// Scroll the combined PR diff to a line-anchored comment so the reviewer
+    /// sees the thread inline. The merge diff loads its files asynchronously, so
+    /// if the target file's excerpt isn't present yet we nudge the diff open and
+    /// retry as it loads.
+    fn navigate_to_comment(
+        &mut self,
+        path: RepoPath,
+        line: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.pr_diff_editor(cx) else {
+            self.open_file_diff(path, cx);
+            return;
+        };
+
+        if Self::scroll_diff_editor_to_comment(&editor, &path, line, window, cx) {
+            return;
+        }
+
+        // The file's excerpt hasn't loaded yet — open it and retry as the diff
+        // populates (each file registers its excerpts incrementally).
+        self.open_file_diff(path.clone(), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            for _ in 0..40 {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let done = this.update_in(cx, |this, window, cx| {
+                    let Some(editor) = this.pr_diff_editor(cx) else {
+                        return false;
+                    };
+                    Self::scroll_diff_editor_to_comment(&editor, &path, line, window, cx)
+                })?;
+                if done {
+                    break;
+                }
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn on_active_item_changed(&mut self, workspace: &Entity<Workspace>, cx: &mut Context<Self>) {
         if self.selected_pr.is_none() {
             return;
@@ -988,6 +1105,23 @@ impl ReviewPanel {
         }
 
         let editor_id = editor.entity_id();
+
+        // The merge diff registers each file's excerpts asynchronously as buffers
+        // load, emitting `BufferRangesUpdated`. Re-inject (re-resolving every
+        // anchor against the now-larger multibuffer) so comments land on their
+        // real lines regardless of load order.
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.diff_editor_subscriptions.entry(editor_id)
+        {
+            let subscription =
+                cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
+                    if let EditorEvent::BufferRangesUpdated { .. } = event {
+                        this.refresh_inline_comment_blocks(cx);
+                    }
+                });
+            entry.insert(subscription);
+        }
+
         if self.injected_comment_blocks.contains_key(&editor_id) {
             return;
         }
