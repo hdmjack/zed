@@ -101,6 +101,66 @@ async fn github_get<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&body).context("failed to parse GitHub response")
 }
 
+/// Fetch every page of a paginated GitHub list endpoint, following the
+/// `rel="next"` URL in the `Link` response header until exhausted. The caller
+/// should request the largest page size (`per_page=100`); without this, only
+/// the first page is returned and later comments/files silently disappear.
+async fn github_get_all<T: serde::de::DeserializeOwned>(
+    http_client: &Arc<dyn HttpClient>,
+    token: &Option<String>,
+    url: &str,
+) -> anyhow::Result<Vec<T>> {
+    let mut items = Vec::new();
+    let mut next_url = Some(url.to_string());
+    while let Some(url) = next_url {
+        let mut builder = Request::get(&url)
+            .header("Accept", "application/vnd.github.v3+json")
+            .follow_redirects(RedirectPolicy::FollowAll);
+        if let Some(token) = token {
+            builder = builder.header("Authorization", format!("Bearer {}", token));
+        }
+        let request = builder.body(AsyncBody::default())?;
+        let mut response = http_client.send(request).await?;
+
+        let mut body = Vec::new();
+        response.body_mut().read_to_end(&mut body).await?;
+
+        if !response.status().is_success() {
+            let text = String::from_utf8_lossy(&body);
+            bail!("GitHub API error {}: {}", response.status().as_u16(), text);
+        }
+
+        let page: Vec<T> =
+            serde_json::from_slice(&body).context("failed to parse GitHub response")?;
+        items.extend(page);
+
+        next_url = response
+            .headers()
+            .get("link")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_next_link);
+    }
+    Ok(items)
+}
+
+/// Extract the `rel="next"` URL from an RFC 5988 `Link` header, e.g.
+/// `<https://api.github.com/...&page=2>; rel="next", <...>; rel="last"`.
+fn parse_next_link(link_header: &str) -> Option<String> {
+    link_header.split(',').find_map(|entry| {
+        let mut segments = entry.split(';');
+        let url = segments
+            .next()?
+            .trim()
+            .strip_prefix('<')?
+            .strip_suffix('>')?;
+        let is_next = segments.any(|segment| {
+            let segment = segment.trim();
+            segment == "rel=\"next\"" || segment == "rel=next"
+        });
+        is_next.then(|| url.to_string())
+    })
+}
+
 async fn github_post<T: serde::de::DeserializeOwned>(
     http_client: &Arc<dyn HttpClient>,
     token: &Option<String>,
@@ -1029,7 +1089,8 @@ impl ReviewProvider for GitHubProvider {
         let token = self.token.clone();
 
         Box::pin(async move {
-            let gh_files: Vec<GhFile> = github_get(&http_client, &token, &url).await?;
+            // Paginated: a PR can touch more than 100 files.
+            let gh_files: Vec<GhFile> = github_get_all(&http_client, &token, &url).await?;
             Ok(gh_files.into_iter().map(map_file).collect())
         })
     }
@@ -1052,16 +1113,19 @@ impl ReviewProvider for GitHubProvider {
         let token = self.token.clone();
 
         Box::pin(async move {
+            // Each endpoint is paginated; follow Link headers so PRs with more
+            // than one page of comments/reviews aren't silently truncated.
             // Fetch inline code comments
             let gh_comments: Vec<GhReviewComment> =
-                github_get(&http_client, &token, &comments_url).await?;
+                github_get_all(&http_client, &token, &comments_url).await?;
 
             // Fetch top-level review submissions (approve, request changes, etc.)
-            let gh_reviews: Vec<GhReview> = github_get(&http_client, &token, &reviews_url).await?;
+            let gh_reviews: Vec<GhReview> =
+                github_get_all(&http_client, &token, &reviews_url).await?;
 
             // Fetch the general PR conversation comments.
             let gh_issue_comments: Vec<GhIssueComment> =
-                github_get(&http_client, &token, &issue_comments_url).await?;
+                github_get_all(&http_client, &token, &issue_comments_url).await?;
 
             let mut comments: Vec<ReviewComment> =
                 gh_comments.into_iter().map(map_review_comment).collect();
@@ -1229,4 +1293,37 @@ impl ReviewProvider for GitHubProvider {
         })
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_next_link;
+
+    #[test]
+    fn parses_next_from_link_header() {
+        let header = "<https://api.github.com/repositories/1/pulls/6/comments?per_page=100&page=2>; rel=\"next\", \
+             <https://api.github.com/repositories/1/pulls/6/comments?per_page=100&page=5>; rel=\"last\"";
+        assert_eq!(
+            parse_next_link(header).as_deref(),
+            Some("https://api.github.com/repositories/1/pulls/6/comments?per_page=100&page=2")
+        );
+    }
+
+    #[test]
+    fn no_next_on_last_page() {
+        // The last page omits rel="next" (only prev/first are present).
+        let header = "<https://api.github.com/repositories/1/pulls/6/comments?page=4>; rel=\"prev\", \
+             <https://api.github.com/repositories/1/pulls/6/comments?page=1>; rel=\"first\"";
+        assert_eq!(parse_next_link(header), None);
+    }
+
+    #[test]
+    fn handles_unquoted_rel_and_garbage() {
+        assert_eq!(
+            parse_next_link("<https://example.com/x?page=2>; rel=next").as_deref(),
+            Some("https://example.com/x?page=2")
+        );
+        assert_eq!(parse_next_link(""), None);
+        assert_eq!(parse_next_link("not a link header"), None);
+    }
 }
