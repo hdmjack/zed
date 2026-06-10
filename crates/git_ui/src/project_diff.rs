@@ -79,6 +79,9 @@ pub struct ProjectDiff {
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
+    /// Optional prefix shown in the tab title (e.g. `#3` for a PR), set by the
+    /// review feature; non-PR diffs leave this `None`.
+    tab_label: Option<SharedString>,
     _task: Task<Result<()>>,
     _subscription: Subscription,
 }
@@ -194,6 +197,7 @@ impl ProjectDiff {
         base_ref: SharedString,
         head_ref: Option<SharedString>,
         project_path: Option<ProjectPath>,
+        tab_label: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -214,6 +218,7 @@ impl ProjectDiff {
             // Reload in case the underlying commits have since been fetched (the
             // tab may have opened before the PR ref was available locally).
             existing.update(cx, |diff, cx| {
+                diff.tab_label = tab_label.clone();
                 diff.branch_diff
                     .update(cx, |branch_diff, cx| branch_diff.reload(cx));
                 if let Some(path) = project_path {
@@ -239,7 +244,10 @@ impl ProjectDiff {
                     )
                 })?;
                 let this = cx.new_window_entity(|window, cx| {
-                    Self::new_impl(branch_diff, project, workspace_handle.clone(), window, cx)
+                    let mut diff =
+                        Self::new_impl(branch_diff, project, workspace_handle.clone(), window, cx);
+                    diff.tab_label = tab_label;
+                    diff
                 })?;
                 workspace_handle.update_in(cx, |workspace, window, cx| {
                     workspace.add_item_to_active_pane(
@@ -564,6 +572,7 @@ impl ProjectDiff {
             buffer_diff_subscriptions: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
+            tab_label: None,
             _task: task,
             _subscription: Subscription::join(
                 branch_diff_subscription,
@@ -1090,7 +1099,14 @@ impl Item for ProjectDiff {
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
         match self.diff_base(cx) {
             DiffBase::Head => Some("Project Diff".into()),
-            DiffBase::Merge { .. } => Some("Branch Diff".into()),
+            DiffBase::Merge { base_ref, .. } => {
+                // Full (untruncated) base ref so the reviewer can see the exact SHA.
+                let detail = format!("Changes since {base_ref}");
+                Some(match &self.tab_label {
+                    Some(label) => format!("{label} · {detail}").into(),
+                    None => detail.into(),
+                })
+            }
         }
     }
 
@@ -1108,7 +1124,11 @@ impl Item for ProjectDiff {
         match self.branch_diff.read(cx).diff_base() {
             DiffBase::Head => "Uncommitted Changes".into(),
             DiffBase::Merge { base_ref, .. } => {
-                format!("Changes since {}", short_git_ref(&base_ref)).into()
+                let detail = format!("Changes since {}", short_git_ref(&base_ref));
+                match &self.tab_label {
+                    Some(label) => format!("{label} · {detail}").into(),
+                    None => detail.into(),
+                }
             }
         }
     }

@@ -729,7 +729,9 @@ pub mod review_panel {
             /// Opens the selected file in the editor (working tree version).
             OpenLocalFile,
             /// Adds a PR review comment on the current line or selection.
-            AddComment
+            AddComment,
+            /// Submits the focused PR comment composer.
+            SubmitComment
         ]
     );
 }

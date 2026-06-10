@@ -212,6 +212,13 @@
     },
   },
   {
+    "context": "ReviewComposer > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-enter": "review_ui::SubmitComment",
+    },
+  },
+  {
     "context": "Markdown",
     "use_key_equivalents": true,
     "bindings": {

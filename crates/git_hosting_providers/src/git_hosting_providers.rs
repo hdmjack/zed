@@ -1,3 +1,4 @@
+mod github_token;
 mod providers;
 mod settings;
 
@@ -11,6 +12,7 @@ use gpui::App;
 use url::Url;
 use util::maybe;
 
+pub use crate::github_token::resolve_github_token;
 pub use crate::providers::*;
 pub use crate::settings::*;
 

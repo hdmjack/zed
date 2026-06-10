@@ -8,8 +8,9 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    Avatar, Color, CommonAnimationExt, ContextMenu, Facepile, Icon, IconButton, IconName, IconSize,
-    IntoElement, Label, LabelSize, PopoverMenuHandle, Tooltip, div, h_flex, prelude::*, v_flex,
+    Avatar, Button, ButtonSize, ButtonStyle, Color, CommonAnimationExt, ContextMenu, Facepile,
+    Icon, IconButton, IconName, IconSize, IntoElement, Label, LabelSize, PopoverMenuHandle,
+    TintColor, Tooltip, div, h_flex, prelude::*, v_flex,
 };
 use ui::PopoverMenu;
 
@@ -42,6 +43,9 @@ pub struct PullRequestList {
     /// does no per-frame filtering.
     filtered: Vec<PullRequestInfo>,
     loading: bool,
+    /// Last load failure (e.g. a GitHub API error), surfaced in place of the
+    /// spinner so the panel doesn't appear stuck.
+    error: Option<SharedString>,
     /// True while a follow-up page is being fetched (infinite scroll).
     loading_more: bool,
     /// Cursor for the next page; None once the last page has loaded.
@@ -97,6 +101,7 @@ impl PullRequestList {
             pull_requests: Vec::new(),
             filtered: Vec::new(),
             loading: false,
+            error: None,
             loading_more: false,
             end_cursor: None,
             has_next_page: false,
@@ -174,26 +179,32 @@ impl PullRequestList {
 
         let state = self.filter.clone();
         self.loading = true;
+        self.error = None;
         self.loading_more = false;
         self.end_cursor = None;
         self.has_next_page = false;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let page = provider
-                .fetch_pull_requests(&owner, &repo, state, None)
-                .await?;
+            let result = provider.fetch_pull_requests(&owner, &repo, state, None).await;
             this.update(cx, |this, cx| {
-                this.pull_requests = page.pull_requests;
-                this.total_count = page.total_count;
-                this.end_cursor = page.end_cursor;
-                this.has_next_page = page.has_next_page;
                 this.loading = false;
-                this.recompute_filtered(cx);
-                this.maybe_load_more_for_fill(cx);
+                match result {
+                    Ok(page) => {
+                        this.error = None;
+                        this.pull_requests = page.pull_requests;
+                        this.total_count = page.total_count;
+                        this.end_cursor = page.end_cursor;
+                        this.has_next_page = page.has_next_page;
+                        this.recompute_filtered(cx);
+                        this.maybe_load_more_for_fill(cx);
+                    }
+                    Err(error) => {
+                        this.error = Some(format_load_error(&error));
+                    }
+                }
                 cx.notify();
-            })?;
-            anyhow::Ok(())
+            })
         })
         .detach_and_log_err(cx);
     }
@@ -475,6 +486,29 @@ impl PullRequestList {
     }
 }
 
+/// Turn a fetch error into a concise, user-facing message. GitHub's raw error
+/// bodies are JSON blobs, so we special-case the common ones (rate limit, auth)
+/// and otherwise show a trimmed version of the message.
+fn format_load_error(error: &anyhow::Error) -> SharedString {
+    let text = error.to_string();
+    let lowercase = text.to_lowercase();
+    if lowercase.contains("rate limit") {
+        if lowercase.contains("authenticated requests") || lowercase.contains("for ") {
+            return "GitHub API rate limit exceeded. Sign in with a GitHub token \
+                (GITHUB_TOKEN or `gh auth login`) for a higher limit, then retry."
+                .into();
+        }
+        return "GitHub API rate limit exceeded. Try again later.".into();
+    }
+    if lowercase.contains("401") || lowercase.contains("bad credentials") {
+        return "GitHub authentication failed. Check your token and retry.".into();
+    }
+    // Fall back to the first line, capped so a giant JSON body doesn't fill the panel.
+    let first_line = text.lines().next().unwrap_or(&text).trim();
+    let trimmed: String = first_line.chars().take(200).collect();
+    SharedString::from(trimmed)
+}
+
 /// Parse a GitHub label hex color (e.g. "1d76db") into an Hsla, falling back to
 /// a neutral gray.
 fn label_hsla(hex: &str) -> gpui::Hsla {
@@ -512,6 +546,42 @@ impl Render for PullRequestList {
                     Label::new("Push to a GitHub remote to see PRs")
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
+                )
+                .into_any_element();
+        }
+
+        if let Some(error) = self.error.clone()
+            && self.pull_requests.is_empty()
+        {
+            return v_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .child(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::Medium)
+                        .color(Color::Error),
+                )
+                .child(
+                    Label::new("Couldn't load pull requests")
+                        .color(Color::Default),
+                )
+                .child(
+                    div().max_w_full().child(
+                        Label::new(error)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
+                .child(
+                    Button::new("pr-list-retry", "Retry")
+                        .size(ButtonSize::Compact)
+                        .style(ButtonStyle::Tinted(TintColor::Accent))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.load_pull_requests(cx);
+                        })),
                 )
                 .into_any_element();
         }

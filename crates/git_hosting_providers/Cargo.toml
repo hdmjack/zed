@@ -14,6 +14,7 @@ path = "src/git_hosting_providers.rs"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+credentials_provider.workspace = true
 futures.workspace = true
 git.workspace = true
 gpui.workspace = true
@@ -23,6 +24,7 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
+smol.workspace = true
 url.workspace = true
 urlencoding.workspace = true
 util.workspace = true

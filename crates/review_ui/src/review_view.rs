@@ -35,6 +35,10 @@ pub enum ReviewViewEvent {
     /// Open (if needed) the file diff and scroll the editor to a line-anchored
     /// comment thread, which renders inline there.
     NavigateToComment { path: RepoPath, line: u32 },
+    /// Fold/unfold a file's diff in the editor — emitted when a file's viewed
+    /// state toggles, mirroring GitHub collapsing a diff once it's viewed (and
+    /// re-expanding it when unviewed).
+    SetFileDiffFolded { path: RepoPath, folded: bool },
     Back,
     /// Loaded comment data changed (reactions merged/toggled); any injected
     /// inline comment blocks should be re-rendered.
@@ -304,6 +308,13 @@ impl ReviewView {
             self.viewed_files.insert(path.clone());
         } else {
             self.viewed_files.remove(&path);
+        }
+        // Mirror GitHub: viewing collapses the file's diff, un-viewing expands it.
+        if let Ok(repo_path) = RepoPath::new(path.as_ref()) {
+            cx.emit(ReviewViewEvent::SetFileDiffFolded {
+                path: repo_path,
+                folded: viewed,
+            });
         }
         self.rebuild(cx);
         cx.notify();
@@ -878,18 +889,30 @@ impl ReviewView {
         self.begin_loading_comments(cx);
 
         cx.spawn(async move |this, cx| {
-            let comments = provider.fetch_reviews(&owner, &repo, pr_number).await?;
-            this.update(cx, |this, cx| {
-                this.set_pr_comments(comments, cx);
+            let result = provider.fetch_reviews(&owner, &repo, pr_number).await;
+            this.update(cx, |this, cx| match result {
+                // `set_pr_comments` clears the loading flag.
+                Ok(comments) => this.set_pr_comments(comments, cx),
+                Err(error) => {
+                    // Clear the spinner so the comments panel doesn't hang; the
+                    // error is logged below.
+                    this.pr_comments_loading = false;
+                    this.rebuild(cx);
+                    cx.notify();
+                    log::error!("failed to load PR comments: {error:#}");
+                }
             })?;
             // Reactions need a separate GraphQL round-trip; fold them in once the
             // comments are already on screen rather than blocking the first paint.
-            let reactions = provider
+            // A failure here is non-fatal (comments still show without tallies).
+            if let Ok(reactions) = provider
                 .fetch_comment_reactions(&owner, &repo, pr_number)
-                .await?;
-            this.update(cx, |this, cx| {
-                this.merge_reactions(reactions, cx);
-            })?;
+                .await
+            {
+                this.update(cx, |this, cx| {
+                    this.merge_reactions(reactions, cx);
+                })?;
+            }
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -1368,6 +1391,32 @@ impl ReviewView {
                 let is_viewed = *viewed;
                 let viewed_path = path.clone();
 
+                let viewed_checkbox = div()
+                    .id(SharedString::from(format!("pr_file_viewed_wrap_{}", ix)))
+                    .flex_none()
+                    .tooltip(Tooltip::text(if is_viewed {
+                        "Viewed"
+                    } else {
+                        "Mark as viewed"
+                    }))
+                    .child({
+                        let weak = cx.weak_entity();
+                        Checkbox::new(
+                            SharedString::from(format!("pr_file_viewed_{}", ix)),
+                            if is_viewed {
+                                ToggleState::Selected
+                            } else {
+                                ToggleState::Unselected
+                            },
+                        )
+                        .on_click_ext(move |_state, _event, _window, cx| {
+                            cx.stop_propagation();
+                            let viewed_path = viewed_path.clone();
+                            weak.update(cx, |this, cx| this.toggle_file_viewed(viewed_path, cx))
+                                .ok();
+                        })
+                    });
+
                 let file_row = h_flex()
                     .id(SharedString::from(format!("pr_file_{}", ix)))
                     .px_2()
@@ -1378,6 +1427,7 @@ impl ReviewView {
                     .cursor_pointer()
                     .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
                     .pl(px(indent))
+                    .child(viewed_checkbox)
                     .child(Icon::new(icon).size(IconSize::Small).color(color))
                     .child(
                         h_flex()
@@ -1427,36 +1477,7 @@ impl ReviewView {
                                         .color(Color::Muted),
                                 ),
                         )
-                    })
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("pr_file_viewed_wrap_{}", ix)))
-                            .flex_none()
-                            .tooltip(Tooltip::text(if is_viewed {
-                                "Viewed"
-                            } else {
-                                "Mark as viewed"
-                            }))
-                            .child({
-                                let weak = cx.weak_entity();
-                                Checkbox::new(
-                                    SharedString::from(format!("pr_file_viewed_{}", ix)),
-                                    if is_viewed {
-                                        ToggleState::Selected
-                                    } else {
-                                        ToggleState::Unselected
-                                    },
-                                )
-                                .on_click_ext(move |_state, _event, _window, cx| {
-                                    cx.stop_propagation();
-                                    let viewed_path = viewed_path.clone();
-                                    weak.update(cx, |this, cx| {
-                                        this.toggle_file_viewed(viewed_path, cx)
-                                    })
-                                    .ok();
-                                })
-                            }),
-                    );
+                    });
 
                 let file_row = if let Some(repo_path) = repo_path {
                     file_row.on_click(cx.listener(move |_this, _event, _window, cx| {

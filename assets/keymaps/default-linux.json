@@ -176,6 +176,12 @@
     },
   },
   {
+    "context": "ReviewComposer > Editor",
+    "bindings": {
+      "ctrl-enter": "review_ui::SubmitComment",
+    },
+  },
+  {
     "context": "Markdown",
     "bindings": {
       "copy": "markdown::Copy",

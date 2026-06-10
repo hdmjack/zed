@@ -2,7 +2,7 @@ use crate::github_provider::GitHubProvider;
 use crate::inline_comment::{ApplySuggestion, ReactToComment, comment_markdown, parse_suggestions, render_pr_comment_block, SuggestionBlock};
 use crate::pull_request_list::{PullRequestList, PullRequestListEvent, RemoteState};
 use crate::review_view::{ReviewView, ReviewViewEvent};
-use crate::github_token::resolve_github_token;
+use git_hosting_providers::resolve_github_token;
 use crate::review_panel_settings::ReviewPanelSettings;
 use crate::review_provider::{PullRequestInfo, ReactionContent, ReviewComment, ReviewProvider};
 use markdown::Markdown;
@@ -29,8 +29,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use ui::{
     Button, ButtonSize, Checkbox, Color, ContextMenu, DynamicSpacing, IconButton, IconName,
-    IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, Tab, ToggleState,
-    Tooltip, h_flex, prelude::*, v_flex,
+    IconSize, IntoElement, KeybindingHint, Label, LabelSize, PopoverMenu, PopoverMenuHandle, Tab,
+    ToggleState, Tooltip, h_flex, prelude::*, v_flex,
 };
 use db::kvp::KeyValueStore;
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,7 @@ use workspace::{
     SERIALIZATION_THROTTLE_TIME, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
-use zed_actions::review_panel::{AddComment, ToggleFocus};
+use zed_actions::review_panel::{AddComment, SubmitComment, ToggleFocus};
 
 const REVIEW_PANEL_KEY: &str = "ReviewPanel";
 
@@ -745,6 +745,9 @@ impl ReviewPanel {
                     ReviewViewEvent::NavigateToComment { path, line } => {
                         this.navigate_to_comment(path.clone(), *line, window, cx);
                     }
+                    ReviewViewEvent::SetFileDiffFolded { path, folded } => {
+                        this.set_file_diff_folded(path.clone(), *folded, cx);
+                    }
                     ReviewViewEvent::Back => {
                         this.selected_pr = None;
                         this.review_view = None;
@@ -965,6 +968,38 @@ impl ReviewPanel {
     fn open_file_diff(&mut self, path: RepoPath, cx: &mut Context<Self>) {
         self.pending_action = Some(PendingAction::OpenDiff(path));
         cx.notify();
+    }
+
+    /// Fold or unfold a file's diff in the combined diff editor (no-op if it's
+    /// already in the requested state or the file isn't present yet). Mirrors
+    /// GitHub collapsing a diff once it's marked viewed and re-expanding it when
+    /// unviewed.
+    fn set_file_diff_folded(&mut self, path: RepoPath, folded: bool, cx: &mut Context<Self>) {
+        let Some(editor) = self.pr_diff_editor(cx) else {
+            return;
+        };
+        let target_path = path.as_std_path().to_string_lossy().to_string();
+        editor.update(cx, |editor, cx| {
+            let buffer_id = editor
+                .buffer()
+                .read(cx)
+                .all_buffers()
+                .into_iter()
+                .find_map(|buffer| {
+                    let buffer = buffer.read(cx);
+                    let file = buffer.file()?;
+                    let file_path = file.path().as_std_path().to_string_lossy().to_string();
+                    (file_path == target_path).then(|| buffer.remote_id())
+                });
+            let Some(buffer_id) = buffer_id else {
+                return;
+            };
+            if folded && !editor.is_buffer_folded(buffer_id, cx) {
+                editor.fold_buffers(vec![buffer_id], cx);
+            } else if !folded && editor.is_buffer_folded(buffer_id, cx) {
+                editor.unfold_buffer(buffer_id, cx);
+            }
+        });
     }
 
     /// The active (or last-injected) PR diff editor, if one is open.
@@ -1771,12 +1806,14 @@ impl ReviewPanel {
                 if let Some(pr) = self.selected_pr.as_ref() {
                     let base_ref = pr.base_sha.clone();
                     let head_ref = Some(pr.head_sha.clone());
+                    let tab_label = Some(SharedString::from(format!("#{}", pr.number)));
                     workspace.update(cx, |workspace, cx| {
                         git_ui::project_diff::ProjectDiff::deploy_merge_diff(
                             workspace,
                             base_ref,
                             head_ref,
                             Some(project_path),
+                            tab_label,
                             window,
                             cx,
                         );
@@ -1793,9 +1830,10 @@ impl ReviewPanel {
                 if let Some(workspace) = self._workspace.upgrade() {
                     let base_ref = pr.base_sha.clone();
                     let head_ref = Some(pr.head_sha.clone());
+                    let tab_label = Some(SharedString::from(format!("#{}", pr.number)));
                     workspace.update(cx, |workspace, cx| {
                         git_ui::project_diff::ProjectDiff::deploy_merge_diff(
-                            workspace, base_ref, head_ref, None, window, cx,
+                            workspace, base_ref, head_ref, None, tab_label, window, cx,
                         );
                     });
                 }
@@ -1992,7 +2030,16 @@ impl RenderOnce for ComposerBubble {
         let colors = cx.theme().colors().clone();
         let id = self.composer_id;
         let submit_panel = self.panel.clone();
+        let action_panel = self.panel.clone();
         let cancel_panel = self.panel;
+
+        // `cmd-enter` (bound to SubmitComment in the ReviewComposer key context)
+        // submits without leaving the editor.
+        let submit_hint = KeybindingHint::new(
+            ui::KeyBinding::for_action(&SubmitComment, cx),
+            colors.element_background,
+        )
+        .suffix(self.submit_label.clone());
 
         v_flex()
             .w_full()
@@ -2004,37 +2051,52 @@ impl RenderOnce for ComposerBubble {
             .border_1()
             .border_color(colors.border_variant)
             .bg(colors.element_background)
+            .key_context("ReviewComposer")
+            .on_action(move |_: &SubmitComment, _window, cx| {
+                action_panel
+                    .update(cx, |panel, cx| panel.submit_inline_composer(id, cx))
+                    .ok();
+            })
             .on_action(|_: &zed_actions::editor::MoveUp, _window, _cx| {})
             .on_action(|_: &zed_actions::editor::MoveDown, _window, _cx| {})
             .child(self.input)
             .child(
                 h_flex()
-                    .justify_end()
+                    .justify_between()
+                    .items_center()
                     .gap_1()
+                    .child(submit_hint)
                     .child(
-                        Button::new(SharedString::from(format!("composer-cancel-{id}")), "Cancel")
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Small)
-                            .on_click(move |_, _window, cx| {
-                                cancel_panel
-                                    .update(cx, |panel, cx| panel.cancel_inline_composer(id, cx))
-                                    .ok();
-                            }),
-                    )
-                    .child(
-                        Button::new(
-                            SharedString::from(format!("composer-submit-{id}")),
-                            self.submit_label,
-                        )
-                        .size(ButtonSize::Compact)
-                        .label_size(LabelSize::Small)
-                        .style(ui::ButtonStyle::Tinted(ui::TintColor::Accent))
-                        .disabled(self.submitting)
-                        .on_click(move |_, _window, cx| {
-                            submit_panel
-                                .update(cx, |panel, cx| panel.submit_inline_composer(id, cx))
-                                .ok();
-                        }),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new(
+                                    SharedString::from(format!("composer-cancel-{id}")),
+                                    "Cancel",
+                                )
+                                .size(ButtonSize::Compact)
+                                .label_size(LabelSize::Small)
+                                .on_click(move |_, _window, cx| {
+                                    cancel_panel
+                                        .update(cx, |panel, cx| panel.cancel_inline_composer(id, cx))
+                                        .ok();
+                                }),
+                            )
+                            .child(
+                                Button::new(
+                                    SharedString::from(format!("composer-submit-{id}")),
+                                    self.submit_label,
+                                )
+                                .size(ButtonSize::Compact)
+                                .label_size(LabelSize::Small)
+                                .style(ui::ButtonStyle::Tinted(ui::TintColor::Accent))
+                                .disabled(self.submitting)
+                                .on_click(move |_, _window, cx| {
+                                    submit_panel
+                                        .update(cx, |panel, cx| panel.submit_inline_composer(id, cx))
+                                        .ok();
+                                }),
+                            ),
                     ),
             )
     }
