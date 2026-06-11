@@ -1,3 +1,4 @@
+use anyhow::Result;
 use credentials_provider::CredentialsProvider;
 use gpui::AsyncApp;
 use smol::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -5,6 +6,21 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 const GITHUB_CREDENTIALS_URL: &str = "https://api.github.com";
+
+/// Where a resolved GitHub token came from, for display in the Account view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GithubTokenSource {
+    /// `GITHUB_TOKEN` environment variable.
+    Env,
+    /// The app's own credential store (OS keychain) — set via the Account view.
+    Keychain,
+    /// Git's credential helper (`git credential fill`).
+    GitCredential,
+    /// The `gh` CLI (`gh auth token`).
+    GhCli,
+    /// No token could be resolved.
+    None,
+}
 
 /// Resolves a GitHub token using a layered fallback chain:
 /// 1. `GITHUB_TOKEN` environment variable (explicit override).
@@ -21,9 +37,20 @@ pub async fn resolve_github_token(
     credential_provider: Arc<dyn CredentialsProvider>,
     cx: &AsyncApp,
 ) -> Option<String> {
+    resolve_github_token_with_source(credential_provider, cx)
+        .await
+        .0
+}
+
+/// Like [`resolve_github_token`], but also reports which layer the token came
+/// from (for the Account view's status display).
+pub async fn resolve_github_token_with_source(
+    credential_provider: Arc<dyn CredentialsProvider>,
+    cx: &AsyncApp,
+) -> (Option<String>, GithubTokenSource) {
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
         if !token.is_empty() {
-            return Some(token);
+            return (Some(token), GithubTokenSource::Env);
         }
     }
 
@@ -33,20 +60,43 @@ pub async fn resolve_github_token(
     {
         if let Ok(token) = String::from_utf8(token_bytes) {
             if !token.is_empty() {
-                return Some(token);
+                return (Some(token), GithubTokenSource::Keychain);
             }
         }
     }
 
     if let Some(token) = git_credential_token().await {
-        return Some(token);
+        return (Some(token), GithubTokenSource::GitCredential);
     }
 
     if let Some(token) = gh_cli_token().await {
-        return Some(token);
+        return (Some(token), GithubTokenSource::GhCli);
     }
 
-    None
+    (None, GithubTokenSource::None)
+}
+
+/// Store a personal access token in the OS keychain (the `Keychain` source),
+/// where [`resolve_github_token`] picks it up after the env var.
+pub async fn store_github_token(
+    credential_provider: Arc<dyn CredentialsProvider>,
+    token: &str,
+    cx: &AsyncApp,
+) -> Result<()> {
+    credential_provider
+        .write_credentials(GITHUB_CREDENTIALS_URL, "github", token.as_bytes(), cx)
+        .await
+}
+
+/// Remove any token stored in the OS keychain by the Account view. Does not
+/// affect the env var, git credential helper, or `gh`.
+pub async fn clear_github_token(
+    credential_provider: Arc<dyn CredentialsProvider>,
+    cx: &AsyncApp,
+) -> Result<()> {
+    credential_provider
+        .delete_credentials(GITHUB_CREDENTIALS_URL, cx)
+        .await
 }
 
 /// Best-effort `gh auth token`. Only succeeds when the `gh` binary is on the

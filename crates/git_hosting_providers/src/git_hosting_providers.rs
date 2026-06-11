@@ -12,7 +12,10 @@ use gpui::App;
 use url::Url;
 use util::maybe;
 
-pub use crate::github_token::resolve_github_token;
+pub use crate::github_token::{
+    GithubTokenSource, clear_github_token, resolve_github_token,
+    resolve_github_token_with_source, store_github_token,
+};
 pub use crate::providers::*;
 pub use crate::settings::*;
 
