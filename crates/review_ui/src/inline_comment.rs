@@ -317,7 +317,7 @@ fn render_suggestion_block(
                         "Apply",
                     )
                     .end_icon(ui::Icon::new(IconName::Check).size(ui::IconSize::XSmall))
-                    .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                    .style(ButtonStyle::Outlined)
                     .label_size(LabelSize::XSmall)
                     .on_click({
                         move |_event, window, cx| {

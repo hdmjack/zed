@@ -1,4 +1,5 @@
 mod comment_card;
+mod configuration_view;
 mod file_list;
 mod github_provider;
 mod inline_comment;

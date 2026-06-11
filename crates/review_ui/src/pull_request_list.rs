@@ -8,9 +8,9 @@ use gpui::{
 };
 use std::sync::Arc;
 use ui::{
-    Avatar, Button, ButtonSize, ButtonStyle, Color, CommonAnimationExt, ContextMenu, Facepile,
-    Icon, IconButton, IconName, IconSize, IntoElement, Label, LabelSize, PopoverMenuHandle,
-    TintColor, Tooltip, div, h_flex, prelude::*, v_flex,
+    Avatar, Button, ButtonSize, ButtonStyle, Color, CommonAnimationExt, ContextMenu, Icon,
+    IconButton, IconName, IconSize, IntoElement, Label, LabelSize, PopoverMenuHandle, Tooltip, div,
+    h_flex, prelude::*, v_flex,
 };
 use ui::PopoverMenu;
 
@@ -262,6 +262,85 @@ impl PullRequestList {
             self.load_pull_requests(cx);
         }
     }
+
+    /// The search/drafts/filter controls, rendered by the panel into the single
+    /// header bar for the list view. Listeners are bound to this entity, so it
+    /// works the same whether rendered here or hoisted into the panel.
+    pub fn render_filter_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let filter_label = match &self.filter {
+            PullRequestState::Open => "Open",
+            PullRequestState::Closed => "Closed",
+            PullRequestState::All => "All",
+        };
+        let weak_list = cx.weak_entity();
+
+        h_flex()
+            .flex_1()
+            .gap_1()
+            .items_center()
+            .child(div().flex_1().child(self.search_editor.clone()))
+            .child(
+                IconButton::new("pr-draft-toggle", IconName::Notepad)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(self.show_drafts)
+                    .tooltip(Tooltip::text(if self.show_drafts {
+                        "Hide drafts"
+                    } else {
+                        "Show drafts"
+                    }))
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.show_drafts = !this.show_drafts;
+                        this.recompute_filtered(cx);
+                        this.maybe_load_more_for_fill(cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                PopoverMenu::new("pr-filter-menu")
+                    .trigger(
+                        IconButton::new("pr-filter-trigger", IconName::Filter)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text(format!("Filter: {}", filter_label))),
+                    )
+                    .anchor(Anchor::TopRight)
+                    .with_handle(self.filter_menu_handle.clone())
+                    .menu(move |window, cx| {
+                        let weak_list = weak_list.clone();
+                        Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                            menu.entry("Open", None, {
+                                let weak_list = weak_list.clone();
+                                move |_window, cx| {
+                                    weak_list
+                                        .update(cx, |this, cx| {
+                                            this.set_filter(PullRequestState::Open, cx)
+                                        })
+                                        .ok();
+                                }
+                            })
+                            .entry("Closed", None, {
+                                let weak_list = weak_list.clone();
+                                move |_window, cx| {
+                                    weak_list
+                                        .update(cx, |this, cx| {
+                                            this.set_filter(PullRequestState::Closed, cx)
+                                        })
+                                        .ok();
+                                }
+                            })
+                            .entry("All", None, {
+                                move |_window, cx| {
+                                    weak_list
+                                        .update(cx, |this, cx| {
+                                            this.set_filter(PullRequestState::All, cx)
+                                        })
+                                        .ok();
+                                }
+                            })
+                        }))
+                    }),
+            )
+            .into_any_element()
+    }
 }
 
 impl PullRequestList {
@@ -273,7 +352,6 @@ impl PullRequestList {
         let updated = pr.updated_at.clone();
         let is_draft = pr.is_draft;
         let comment_count = pr.comment_count;
-        let participants = pr.participants.clone();
 
         let checks_icon = pr.checks.map(|rollup| {
             let (icon, color, tip) = match rollup {
@@ -328,25 +406,6 @@ impl PullRequestList {
             .map(|l| (l.name.clone(), label_hsla(&l.color)))
             .collect();
 
-        let reviewer_facepile = (!participants.is_empty()).then(|| {
-            div()
-                .id(("pr-reviewers", number as usize))
-                .flex_none()
-                .tooltip(Tooltip::text(format!(
-                    "Participants: {}",
-                    participants.join(", ")
-                )))
-                .child(Facepile::new(
-                    participants
-                        .iter()
-                        .map(|login| {
-                            Avatar::new(crate::review_view::avatar_url(login))
-                                .size(px(14.0))
-                                .into_any_element()
-                        })
-                        .collect(),
-                ))
-        });
         let status_icons = h_flex()
             .flex_none()
             .gap_1()
@@ -393,8 +452,7 @@ impl PullRequestList {
                                 ),
                         ),
                 )
-            })
-            .children(reviewer_facepile);
+            });
 
         h_flex()
             .id(SharedString::from(format!("pr_{}", number)))
@@ -578,7 +636,7 @@ impl Render for PullRequestList {
                 .child(
                     Button::new("pr-list-retry", "Retry")
                         .size(ButtonSize::Compact)
-                        .style(ButtonStyle::Tinted(TintColor::Accent))
+                        .style(ButtonStyle::Outlined)
                         .on_click(cx.listener(|this, _event, _window, cx| {
                             this.load_pull_requests(cx);
                         })),
@@ -617,94 +675,10 @@ impl Render for PullRequestList {
             PullRequestState::All => "All",
         };
         let filtered_count = self.filtered.len();
-        let weak_list = cx.weak_entity();
 
         v_flex()
             .id("review-pr-list")
             .size_full()
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .gap_1()
-                    .items_center()
-                    .child(div().flex_1().child(self.search_editor.clone()))
-                    .child(
-                        IconButton::new("pr-draft-toggle", IconName::Notepad)
-                        .icon_size(IconSize::Small)
-                        .toggle_state(self.show_drafts)
-                        .tooltip(Tooltip::text(if self.show_drafts {
-                            "Hide drafts"
-                        } else {
-                            "Show drafts"
-                        }))
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.show_drafts = !this.show_drafts;
-                            this.recompute_filtered(cx);
-                            this.maybe_load_more_for_fill(cx);
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        PopoverMenu::new("pr-filter-menu")
-                            .trigger(
-                                IconButton::new("pr-filter-trigger", IconName::Filter)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text(format!("Filter: {}", filter_label))),
-                            )
-                            .anchor(Anchor::TopRight)
-                            .with_handle(self.filter_menu_handle.clone())
-                            .menu({
-                                move |window, cx| {
-                                    let weak_list = weak_list.clone();
-                                    Some(ContextMenu::build(
-                                        window,
-                                        cx,
-                                        move |menu, _window, _cx| {
-                                            menu.entry("Open", None, {
-                                                let weak_list = weak_list.clone();
-                                                move |_window, cx| {
-                                                    weak_list
-                                                        .update(cx, |this, cx| {
-                                                            this.set_filter(
-                                                                PullRequestState::Open,
-                                                                cx,
-                                                            );
-                                                        })
-                                                        .ok();
-                                                }
-                                            })
-                                            .entry("Closed", None, {
-                                                let weak_list = weak_list.clone();
-                                                move |_window, cx| {
-                                                    weak_list
-                                                        .update(cx, |this, cx| {
-                                                            this.set_filter(
-                                                                PullRequestState::Closed,
-                                                                cx,
-                                                            );
-                                                        })
-                                                        .ok();
-                                                }
-                                            })
-                                            .entry("All", None, {
-                                                move |_window, cx| {
-                                                    weak_list
-                                                        .update(cx, |this, cx| {
-                                                            this.set_filter(
-                                                                PullRequestState::All,
-                                                                cx,
-                                                            );
-                                                        })
-                                                        .ok();
-                                                }
-                                            })
-                                        },
-                                    ))
-                                }
-                            }),
-                    ),
-            )
             .child(
                 h_flex().px_2().pb_1().child(
                     Label::new(format!(

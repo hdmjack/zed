@@ -1,3 +1,4 @@
+use crate::configuration_view::{ConfigurationEvent, ConfigurationView};
 use crate::github_provider::GitHubProvider;
 use crate::inline_comment::{ApplySuggestion, ReactToComment, comment_markdown, parse_suggestions, render_pr_comment_block, SuggestionBlock};
 use crate::pull_request_list::{PullRequestList, PullRequestListEvent, RemoteState};
@@ -64,6 +65,7 @@ struct RecentReview {
 enum ActiveView {
     PullRequestList,
     ReviewThread,
+    Configuration,
 }
 
 enum PendingAction {
@@ -91,6 +93,7 @@ pub struct ReviewPanel {
     recent_reviews: Vec<RecentReview>,
     http_client: Arc<dyn HttpClient>,
     pull_request_list: Option<(Entity<PullRequestList>, Subscription)>,
+    configuration_view: Option<(Entity<ConfigurationView>, Subscription)>,
     provider: Option<Arc<dyn ReviewProvider>>,
     remote_owner: Option<String>,
     remote_repo: Option<String>,
@@ -342,6 +345,7 @@ impl ReviewPanel {
             recent_reviews: Vec::new(),
             http_client: workspace.client().http_client(),
             pull_request_list: None,
+            configuration_view: None,
             provider: None,
             remote_owner: None,
             remote_repo: None,
@@ -566,8 +570,13 @@ impl ReviewPanel {
                         )
                         .separator()
                     })
-                    .entry("Configuration", None, |_window, _cx| {
-                        // TODO: dispatch OpenConfiguration action
+                    .entry("Configuration", None, {
+                        let weak_panel = weak_panel.clone();
+                        move |window, cx| {
+                            weak_panel
+                                .update(cx, |this, cx| this.open_configuration(window, cx))
+                                .ok();
+                        }
                     })
                     .separator()
                     .entry("Full Screen", None, |_window, _cx| {
@@ -587,40 +596,84 @@ impl ReviewPanel {
             })
     }
 
-    fn render_toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .id("review-panel-toolbar")
+    /// The single functional header bar for the current view. The standalone
+    /// "Review" name bar is gone — panel identity comes from the dock tab, and
+    /// each view folds its controls and actions into this one row (matching the
+    /// git panel / Agent settings). Returns `None` for the Configuration view,
+    /// which renders its own `← GitHub account` bar.
+    fn render_header(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let bar = h_flex()
+            .id("review-panel-header")
             .h(Tab::container_height(cx))
             .max_w_full()
             .flex_none()
-            .justify_between()
-            .gap_2()
+            .gap(DynamicSpacing::Base04.rems(cx))
+            .px(DynamicSpacing::Base04.rems(cx))
             .bg(cx.theme().colors().tab_bar_background)
             .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(
-                h_flex()
-                    .size_full()
-                    .gap(DynamicSpacing::Base04.rems(cx))
-                    .pl(DynamicSpacing::Base04.rems(cx))
-                    .child(Label::new("Review").size(LabelSize::Small)),
-            )
-            .child(
-                h_flex()
-                    .flex_none()
-                    .gap(DynamicSpacing::Base02.rems(cx))
-                    .pr(DynamicSpacing::Base06.rems(cx))
-                    .child(
-                        IconButton::new("new-review", IconName::Plus)
+            .border_color(cx.theme().colors().border);
+
+        let actions = h_flex()
+            .flex_none()
+            .gap(DynamicSpacing::Base02.rems(cx))
+            .child(self.render_recent_reviews_menu(cx))
+            .child(self.render_options_menu(window, cx));
+
+        match self.active_view {
+            ActiveView::PullRequestList => {
+                let filter_bar = self
+                    .pull_request_list
+                    .as_ref()
+                    .map(|(list, _)| list.update(cx, |list, cx| list.render_filter_bar(cx)));
+                Some(
+                    bar.child(div().flex_1().children(filter_bar))
+                        .child(
+                            actions.child(
+                                IconButton::new("new-review", IconName::Plus)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("New Review"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.show_pull_request_list(window, cx);
+                                    })),
+                            ),
+                        )
+                        .into_any_element(),
+                )
+            }
+            ActiveView::ReviewThread => {
+                let title = self.selected_pr.as_ref().map(|pr| {
+                    (SharedString::from(format!("#{}", pr.number)), pr.title.clone())
+                });
+                Some(
+                    bar.child(
+                        IconButton::new("back-to-pr-list", IconName::ArrowLeft)
                             .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("New Review"))
+                            .tooltip(Tooltip::text("Back to pull requests"))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.show_pull_request_list(window, cx);
+                                this.close_review(window, cx);
                             })),
                     )
-                    .child(self.render_recent_reviews_menu(cx))
-                    .child(self.render_options_menu(window, cx)),
-            )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .gap_1()
+                            .overflow_x_hidden()
+                            .items_center()
+                            .when_some(title, |row, (number, pr_title)| {
+                                row.child(Label::new(number).color(Color::Muted))
+                                    .child(
+                                        div().overflow_x_hidden().flex_1().child(
+                                            Label::new(pr_title).single_line(),
+                                        ),
+                                    )
+                            }),
+                    )
+                    .child(actions)
+                    .into_any_element(),
+                )
+            }
+            ActiveView::Configuration => None,
+        }
     }
 
     fn set_remote_state(&mut self, state: RemoteState, cx: &mut Context<Self>) {
@@ -765,17 +818,6 @@ impl ReviewPanel {
                     }
                     ReviewViewEvent::SetFileDiffFolded { path, folded } => {
                         this.set_file_diff_folded(path.clone(), *folded, cx);
-                    }
-                    ReviewViewEvent::Back => {
-                        this.selected_pr = None;
-                        this.review_view = None;
-                        this.remove_all_injected_blocks(cx);
-                        this.diff_editor_subscriptions.clear();
-                        this.pr_diff = None;
-                        this.pr_diff_subscription = None;
-                        this.diff_revealed = false;
-                        this.pr_diff_opened = false;
-                        this.show_pull_request_list(window, cx);
                     }
                     ReviewViewEvent::CommentsChanged => {
                         // Comments just settled: open the diff if the tree is
@@ -983,6 +1025,50 @@ impl ReviewPanel {
 
         self.active_view = ActiveView::PullRequestList;
         self.serialize(cx);
+        cx.notify();
+    }
+
+    /// Leave the current PR review entirely: tear down the review view, injected
+    /// comment blocks, and diff subscriptions, then return to the list.
+    fn close_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_pr = None;
+        self.review_view = None;
+        self.remove_all_injected_blocks(cx);
+        self.diff_editor_subscriptions.clear();
+        self.pr_diff = None;
+        self.pr_diff_subscription = None;
+        self.diff_revealed = false;
+        self.pr_diff_opened = false;
+        self.show_pull_request_list(window, cx);
+    }
+
+    fn open_configuration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let credentials = zed_credentials_provider::global(cx);
+        let view = cx.new(|cx| {
+            ConfigurationView::new(
+                credentials,
+                self.http_client.clone(),
+                self.remote_owner.clone(),
+                self.remote_repo.clone(),
+                window,
+                cx,
+            )
+        });
+        let subscription = cx.subscribe(&view, |this, _view, event, cx| match event {
+            ConfigurationEvent::CredentialsChanged => {
+                // Rebuild the provider with the new token (set_provider reloads
+                // the list) and return to the pull request list.
+                this.initialize_provider(cx);
+                this.active_view = ActiveView::PullRequestList;
+                cx.notify();
+            }
+            ConfigurationEvent::Back => {
+                this.active_view = ActiveView::PullRequestList;
+                cx.notify();
+            }
+        });
+        self.configuration_view = Some((view, subscription));
+        self.active_view = ActiveView::Configuration;
         cx.notify();
     }
 
@@ -1946,11 +2032,12 @@ impl ReviewPanel {
 impl Render for ReviewPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.flush_pending_action(window, cx);
+        let header = self.render_header(window, cx);
         v_flex()
             .id("review_panel")
             .track_focus(&self.focus_handle)
             .size_full()
-            .child(self.render_toolbar(window, cx))
+            .children(header)
             .map(|parent| match &self.active_view {
                 ActiveView::PullRequestList => {
                     if let Some((pr_list, _)) = &self.pull_request_list {
@@ -1968,6 +2055,19 @@ impl Render for ReviewPanel {
                 ActiveView::ReviewThread => {
                     if let Some((review_view, _)) = &self.review_view {
                         parent.child(review_view.clone())
+                    } else {
+                        parent.child(
+                            v_flex()
+                                .size_full()
+                                .justify_center()
+                                .items_center()
+                                .child(Label::new("Loading...").color(Color::Muted)),
+                        )
+                    }
+                }
+                ActiveView::Configuration => {
+                    if let Some((configuration_view, _)) = &self.configuration_view {
+                        parent.child(configuration_view.clone())
                     } else {
                         parent.child(
                             v_flex()
@@ -2190,7 +2290,7 @@ impl RenderOnce for ComposerBubble {
                                 )
                                 .size(ButtonSize::Compact)
                                 .label_size(LabelSize::Small)
-                                .style(ui::ButtonStyle::Tinted(ui::TintColor::Accent))
+                                .style(ui::ButtonStyle::Outlined)
                                 .disabled(self.submitting)
                                 .on_click(move |_, _window, cx| {
                                     submit_panel

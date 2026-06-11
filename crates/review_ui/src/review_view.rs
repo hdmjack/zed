@@ -18,9 +18,8 @@ use gpui::{
 use std::sync::Arc;
 use ui::{
     Avatar, ButtonLike, ButtonSize, Checkbox, Color, ContextMenu, DiffStat, ElevationIndex,
-    Facepile, Icon, IconButton,
-    IconName, IconSize, IntoElement, Label, LabelSize, PopoverMenu, PopoverMenuHandle, SplitButton,
-    ToggleState, Tooltip, div, h_flex, prelude::*, v_flex,
+    Facepile, Icon, IconName, IconSize, IntoElement, Label, LabelSize, PopoverMenu,
+    PopoverMenuHandle, SplitButton, ToggleState, Tooltip, div, h_flex, prelude::*, v_flex,
 };
 
 /// Which resizable section a divider drag is adjusting.
@@ -39,7 +38,6 @@ pub enum ReviewViewEvent {
     /// state toggles, mirroring GitHub collapsing a diff once it's viewed (and
     /// re-expanding it when unviewed).
     SetFileDiffFolded { path: RepoPath, folded: bool },
-    Back,
     /// Loaded comment data changed (reactions merged/toggled); any injected
     /// inline comment blocks should be re-rendered.
     CommentsChanged,
@@ -1741,8 +1739,6 @@ impl ReviewView {
 
 impl Render for ReviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let pr_number = self.selected_pr.number;
-        let pr_title = self.selected_pr.title.clone();
         let pr_author = self.selected_pr.author.clone();
         let file_count = self.file_entries.len();
 
@@ -1897,31 +1893,6 @@ impl Render for ReviewView {
                     .gap_0p5()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(
-                                IconButton::new("back-to-pr-list", IconName::ArrowLeft)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Back to PR list"))
-                                    .on_click(cx.listener(|_this, _, _window, cx| {
-                                        cx.emit(ReviewViewEvent::Back);
-                                    })),
-                            )
-                            .child(
-                                Label::new(format!("#{}", pr_number))
-                                    .size(LabelSize::Large)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                div().overflow_x_hidden().flex_1().child(
-                                    Label::new(pr_title.to_string())
-                                        .size(LabelSize::Large)
-                                        .single_line(),
-                                ),
-                            ),
-                    )
                     .child(
                         h_flex()
                             .gap_1p5()
