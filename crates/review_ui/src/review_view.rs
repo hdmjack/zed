@@ -84,6 +84,17 @@ pub struct ReviewView {
     status: Option<PullRequestStatus>,
     pr_comments: Vec<ReviewComment>,
     pr_comments_loading: bool,
+    /// Whether the comment fetch has settled (success or error). The sidebar
+    /// holds off grouping rows, and the panel holds off revealing the diff,
+    /// until both this and `files_loaded` are true.
+    comments_loaded: bool,
+    /// Whether the reactions round-trip has settled (success or error). The diff
+    /// reveal waits for this so reactions are folded into the comment blocks
+    /// before they're injected (otherwise a late reaction merge re-injects and
+    /// visibly reflows the diff).
+    reactions_settled: bool,
+    /// Whether the file list (api files or tree diff) has arrived.
+    files_loaded: bool,
     pr_api_files: Vec<PullRequestFile>,
     tree_diff: Option<TreeDiff>,
     comment_editor: Entity<Editor>,
@@ -243,6 +254,9 @@ impl ReviewView {
             status: None,
             pr_comments: Vec::new(),
             pr_comments_loading: false,
+            comments_loaded: false,
+            reactions_settled: false,
+            files_loaded: false,
             pr_api_files: Vec::new(),
             tree_diff: None,
             comment_editor,
@@ -381,6 +395,7 @@ impl ReviewView {
         self.tree_diff = tree_diff.map(|td| TreeDiff {
             entries: td.entries.clone(),
         });
+        self.files_loaded = true;
         self.rebuild(cx);
         cx.notify();
     }
@@ -411,6 +426,7 @@ impl ReviewView {
     fn set_pr_comments(&mut self, comments: Vec<ReviewComment>, cx: &mut Context<Self>) {
         self.pr_comments = comments;
         self.pr_comments_loading = false;
+        self.comments_loaded = true;
         self.rebuild(cx);
         // The diff editor may have opened before comments finished loading (e.g.
         // on restore), so prompt the panel to (re)inject inline blocks.
@@ -420,8 +436,23 @@ impl ReviewView {
 
     fn set_pr_api_files(&mut self, files: Vec<PullRequestFile>, cx: &mut Context<Self>) {
         self.pr_api_files = files;
+        self.files_loaded = true;
         self.rebuild(cx);
         cx.notify();
+    }
+
+    /// Whether both the file list and the comments have loaded — the gate for
+    /// grouping the sidebar rows (and, via `comments_loaded`, for revealing the
+    /// diff). Holding off until both are present avoids reflowing the sidebar as
+    /// each async load completes.
+    fn content_ready(&self) -> bool {
+        self.files_loaded && self.comments_loaded
+    }
+
+    /// Ready to reveal the diff: comments fetched and the reactions round-trip
+    /// settled, so the inline comment blocks can be injected once, complete.
+    pub fn comments_ready(&self) -> bool {
+        self.comments_loaded && self.reactions_settled
     }
 
     fn toggle_directory(&mut self, path: SharedString, cx: &mut Context<Self>) {
@@ -654,6 +685,16 @@ impl ReviewView {
     /// the mutator methods above so it can't be skipped.
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.file_entries = self.compute_file_entries();
+
+        // Hold off building the grouped rows until both files and comments have
+        // loaded, so the sidebar lays out once rather than reflowing per-arrival.
+        if !self.content_ready() {
+            self.file_rows = vec![RowKind::Loading];
+            self.comment_rows = Vec::new();
+            self.file_list_state.reset(self.file_rows.len());
+            self.comment_list_state.reset(self.comment_rows.len());
+            return;
+        }
 
         let mut file_comments: HashMap<SharedString, Vec<ReviewComment>> = HashMap::default();
         let mut general_comments: Vec<ReviewComment> = Vec::new();
@@ -894,25 +935,34 @@ impl ReviewView {
                 // `set_pr_comments` clears the loading flag.
                 Ok(comments) => this.set_pr_comments(comments, cx),
                 Err(error) => {
-                    // Clear the spinner so the comments panel doesn't hang; the
-                    // error is logged below.
+                    // Clear the spinner so the comments panel doesn't hang, and
+                    // still mark the load settled so the sidebar/diff gates
+                    // release. The error is logged below.
                     this.pr_comments_loading = false;
+                    this.comments_loaded = true;
+                    this.reactions_settled = true;
                     this.rebuild(cx);
+                    // Let the panel's diff-open gate know comments have settled.
+                    cx.emit(ReviewViewEvent::CommentsChanged);
                     cx.notify();
                     log::error!("failed to load PR comments: {error:#}");
                 }
             })?;
-            // Reactions need a separate GraphQL round-trip; fold them in once the
-            // comments are already on screen rather than blocking the first paint.
-            // A failure here is non-fatal (comments still show without tallies).
-            if let Ok(reactions) = provider
+            // Reactions need a separate GraphQL round-trip. The diff reveal waits
+            // for this to settle so reactions are folded into the blocks before
+            // they're injected (avoids a late re-inject that reflows the diff).
+            let reactions = provider
                 .fetch_comment_reactions(&owner, &repo, pr_number)
-                .await
-            {
-                this.update(cx, |this, cx| {
-                    this.merge_reactions(reactions, cx);
-                })?;
-            }
+                .await;
+            this.update(cx, |this, cx| match reactions {
+                Ok(reactions) => this.merge_reactions(reactions, cx),
+                Err(error) => {
+                    this.reactions_settled = true;
+                    cx.emit(ReviewViewEvent::CommentsChanged);
+                    cx.notify();
+                    log::error!("failed to load comment reactions: {error:#}");
+                }
+            })?;
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -931,6 +981,7 @@ impl ReviewView {
                 comment.reactions = reaction.reactions.clone();
             }
         }
+        self.reactions_settled = true;
         self.rebuild(cx);
         cx.emit(ReviewViewEvent::CommentsChanged);
         cx.notify();

@@ -82,6 +82,15 @@ pub struct ProjectDiff {
     /// Optional prefix shown in the tab title (e.g. `#3` for a PR), set by the
     /// review feature; non-PR diffs leave this `None`.
     tab_label: Option<SharedString>,
+    /// When true, the editor is held behind a loading state. Driven externally
+    /// by the review panel so the PR diff only reveals once its files are loaded
+    /// and review comments injected (avoids file-then-comments streaming jank).
+    review_loading: bool,
+    /// Set once an initial refresh has registered all changed files. Observed by
+    /// the review panel to know when the held PR diff is safe to reveal (a plain
+    /// `_task.is_ready()` check isn't observable — the task's final notify fires
+    /// before it resolves).
+    initial_load_complete: bool,
     _task: Task<Result<()>>,
     _subscription: Subscription,
 }
@@ -198,6 +207,9 @@ impl ProjectDiff {
         head_ref: Option<SharedString>,
         project_path: Option<ProjectPath>,
         tab_label: Option<SharedString>,
+        // Start the diff held behind a loading state (the review panel releases
+        // it once files + comments are ready). Non-review callers pass false.
+        review_loading: bool,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -219,6 +231,7 @@ impl ProjectDiff {
             // tab may have opened before the PR ref was available locally).
             existing.update(cx, |diff, cx| {
                 diff.tab_label = tab_label.clone();
+                diff.review_loading = review_loading;
                 diff.branch_diff
                     .update(cx, |branch_diff, cx| branch_diff.reload(cx));
                 if let Some(path) = project_path {
@@ -247,6 +260,7 @@ impl ProjectDiff {
                     let mut diff =
                         Self::new_impl(branch_diff, project, workspace_handle.clone(), window, cx);
                     diff.tab_label = tab_label;
+                    diff.review_loading = review_loading;
                     diff
                 })?;
                 workspace_handle.update_in(cx, |workspace, window, cx| {
@@ -573,6 +587,8 @@ impl ProjectDiff {
             pending_scroll: None,
             review_comment_count: 0,
             tab_label: None,
+            review_loading: false,
+            initial_load_complete: false,
             _task: task,
             _subscription: Subscription::join(
                 branch_diff_subscription,
@@ -583,6 +599,23 @@ impl ProjectDiff {
 
     pub fn diff_base<'a>(&'a self, cx: &'a App) -> &'a DiffBase {
         self.branch_diff.read(cx).diff_base()
+    }
+
+    /// Hold (or release) the diff behind a loading state. Used by the review
+    /// panel to reveal a PR diff only once its files are loaded and comments are
+    /// injected, so it doesn't visibly stream in.
+    pub fn set_review_loading(&mut self, loading: bool, cx: &mut Context<Self>) {
+        if self.review_loading != loading {
+            self.review_loading = loading;
+            cx.notify();
+        }
+    }
+
+    /// True once an initial refresh has registered all changed files and at
+    /// least one excerpt is present. The review panel observes this (via the
+    /// refresh-completion notify) to reveal a held PR diff.
+    pub fn is_fully_loaded(&self, cx: &App) -> bool {
+        self.initial_load_complete && !self.multibuffer.read(cx).is_empty()
     }
 
     pub fn move_to_entry(
@@ -999,6 +1032,7 @@ impl ProjectDiff {
                 });
             }
             this.pending_scroll.take();
+            this.initial_load_complete = true;
             cx.notify();
         })?;
 
@@ -1287,6 +1321,13 @@ impl Render for ProjectDiff {
 
         let is_branch_diff_view = matches!(self.diff_base(cx), DiffBase::Merge { .. });
 
+        // The review panel holds the diff behind a loading state until it has
+        // finished loading every file AND injected the review comments, so the
+        // diff appears all at once (with comments) instead of streaming in.
+        let holding = self.review_loading;
+        let show_loading = (is_empty && is_loading) || holding;
+        let show_editor = !is_empty && !holding;
+
         div()
             .track_focus(&self.focus_handle)
             .key_context(if is_empty { "EmptyPane" } else { "GitDiff" })
@@ -1298,13 +1339,21 @@ impl Render for ProjectDiff {
             .items_center()
             .justify_center()
             .size_full()
-            .when(is_empty && is_loading, |el| {
+            .when(show_loading, |el| {
                 let rems = TextSize::Large.rems(cx);
                 el.child(
-                    Icon::new(IconName::LoadCircle)
-                        .size(IconSize::Custom(rems))
-                        .color(Color::Accent)
-                        .with_rotate_animation(3)
+                    v_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::Custom(rems))
+                                .color(Color::Accent)
+                                .with_rotate_animation(3),
+                        )
+                        .when(is_branch_diff_view, |el| {
+                            el.child(Label::new("Loading changes…").color(Color::Muted))
+                        })
                         .into_any_element(),
                 )
             })
@@ -1355,7 +1404,7 @@ impl Render for ProjectDiff {
                         ),
                 )
             })
-            .when(!is_empty, |el| el.child(self.editor.clone()))
+            .when(show_editor, |el| el.child(self.editor.clone()))
     }
 }
 

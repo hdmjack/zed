@@ -69,6 +69,10 @@ enum ActiveView {
 enum PendingAction {
     OpenDiff(RepoPath),
     SelectPullRequest(PullRequestInfo),
+    /// Open the selected PR's combined diff at the top of the first file. Only
+    /// queued once both the tree diff and comments have loaded, so the diff
+    /// reveals with its inline comments already present.
+    OpenPrDiff,
 }
 
 pub struct ReviewPanel {
@@ -95,6 +99,14 @@ pub struct ReviewPanel {
     pending_action: Option<PendingAction>,
     /// Whether the PR's diff has been auto-opened for the current selection.
     pr_diff_opened: bool,
+    /// Handle to the open PR diff, used to release its loading gate once the
+    /// diff is fully loaded and comments are injected.
+    pr_diff: Option<WeakEntity<git_ui::project_diff::ProjectDiff>>,
+    /// Observes the PR diff so we re-check the reveal gate when it finishes
+    /// loading (its final load completion isn't an editor event we'd otherwise see).
+    pr_diff_subscription: Option<Subscription>,
+    /// Whether the PR diff's loading gate has been released for this selection.
+    diff_revealed: bool,
     injected_comment_blocks: HashMap<EntityId, (WeakEntity<Editor>, Vec<CustomBlockId>)>,
     /// Per diff-editor subscriptions used to re-inject inline comment blocks as
     /// the merge diff loads its files incrementally (each file emits
@@ -337,6 +349,9 @@ impl ReviewPanel {
             pr_ref_fetch_task: None,
             pending_action: None,
             pr_diff_opened: false,
+            pr_diff: None,
+            pr_diff_subscription: None,
+            diff_revealed: false,
             injected_comment_blocks: HashMap::default(),
             diff_editor_subscriptions: HashMap::default(),
             inline_composers: Vec::new(),
@@ -680,6 +695,9 @@ impl ReviewPanel {
         self.base_branch = Some(pr.base_ref.clone());
         self.head_branch = Some(pr.head_ref.clone());
         self.pr_diff_opened = false;
+        self.pr_diff = None;
+        self.pr_diff_subscription = None;
+        self.diff_revealed = false;
 
         self.fetch_pr_ref(pr.number, cx);
         self.pending_action = Some(PendingAction::SelectPullRequest(pr.clone()));
@@ -753,10 +771,22 @@ impl ReviewPanel {
                         this.review_view = None;
                         this.remove_all_injected_blocks(cx);
                         this.diff_editor_subscriptions.clear();
+                        this.pr_diff = None;
+                        this.pr_diff_subscription = None;
+                        this.diff_revealed = false;
+                        this.pr_diff_opened = false;
                         this.show_pull_request_list(window, cx);
                     }
                     ReviewViewEvent::CommentsChanged => {
-                        this.refresh_inline_comment_blocks(cx);
+                        // Comments just settled: open the diff if the tree is
+                        // ready. While held, only check the reveal gate (which
+                        // injects once at reveal); once revealed, reinject live.
+                        this.maybe_open_pr_diff(cx);
+                        if this.diff_revealed {
+                            this.refresh_inline_comment_blocks(cx);
+                        } else {
+                            this.maybe_reveal_diff(cx);
+                        }
                     }
                     ReviewViewEvent::Merged => {
                         this.refresh_pull_requests(cx);
@@ -911,20 +941,11 @@ impl ReviewPanel {
                     });
                 }
 
-                // Auto-open the PR's combined diff once, navigated to the first
-                // changed file. Opening via a concrete file (rather than the
-                // whole diff with no path) gives the editor a resolvable initial
-                // selection, avoiding a fold/selection panic.
-                if this.selected_pr.is_some() && !this.pr_diff_opened {
-                    if let Some(first_path) = this
-                        .tree_diff
-                        .as_ref()
-                        .and_then(|d| d.entries.keys().min().cloned())
-                    {
-                        this.pr_diff_opened = true;
-                        this.pending_action = Some(PendingAction::OpenDiff(first_path));
-                    }
-                }
+                // The tree diff is now ready; open the combined diff if comments
+                // have also finished loading (otherwise the CommentsChanged event
+                // will trigger it). Opens at the top of the first file with its
+                // comments already inline.
+                this.maybe_open_pr_diff(cx);
             })?;
             anyhow::Ok(())
         })
@@ -968,6 +989,47 @@ impl ReviewPanel {
     fn open_file_diff(&mut self, path: RepoPath, cx: &mut Context<Self>) {
         self.pending_action = Some(PendingAction::OpenDiff(path));
         cx.notify();
+    }
+
+    /// Open the selected PR's combined diff once the tree diff is ready (the PR
+    /// ref is available locally). The diff opens at the top of the first file,
+    /// held behind a loading state; `maybe_reveal_diff` releases it once files
+    /// are loaded and comments injected. Queues a pending action so the deploy
+    /// (which needs a Window) happens in the render flush.
+    fn maybe_open_pr_diff(&mut self, cx: &mut Context<Self>) {
+        if self.pr_diff_opened || self.selected_pr.is_none() || self.tree_diff.is_none() {
+            return;
+        }
+        self.pr_diff_opened = true;
+        self.pending_action = Some(PendingAction::OpenPrDiff);
+        cx.notify();
+    }
+
+    /// Reveal the held PR diff once the comments have loaded (and been injected)
+    /// and the diff has finished loading all its files, so the diff and its
+    /// inline comments appear together instead of streaming in.
+    fn maybe_reveal_diff(&mut self, cx: &mut Context<Self>) {
+        if self.diff_revealed {
+            return;
+        }
+        let Some(diff) = self.pr_diff.as_ref().and_then(|diff| diff.upgrade()) else {
+            return;
+        };
+        let comments_ready = self
+            .review_view
+            .as_ref()
+            .is_some_and(|(view, _)| view.read(cx).comments_ready());
+        if !comments_ready || !diff.read(cx).is_fully_loaded(cx) {
+            return;
+        }
+        self.diff_revealed = true;
+        // Inject all comment blocks synchronously *before* releasing the gate, so
+        // the diff reveals with its comments already in place (no drop-in). The
+        // incremental injections during the held phase happen off-screen.
+        if let Some(editor) = self.pr_diff_editor(cx) {
+            self.reinject_inline_blocks(&editor, cx);
+        }
+        diff.update(cx, |diff, cx| diff.set_review_loading(false, cx));
     }
 
     /// Fold or unfold a file's diff in the combined diff editor (no-op if it's
@@ -1125,6 +1187,18 @@ impl ReviewPanel {
             return;
         };
 
+        // Capture the PR diff entity so we can release its loading gate once the
+        // diff is fully loaded and comments are injected. Observe it so the
+        // load-completion notify re-checks the reveal gate.
+        if self.pr_diff.is_none() {
+            if let Some(diff) = item.downcast::<git_ui::project_diff::ProjectDiff>() {
+                self.pr_diff = Some(diff.downgrade());
+                self.pr_diff_subscription = Some(cx.observe(&diff, |this, _diff, cx| {
+                    this.maybe_reveal_diff(cx);
+                }));
+            }
+        }
+
         // Add the per-file "viewed" checkbox to the diff editor's buffer headers.
         // (The "Add Comment" right-click entry is contributed by the addon's
         // extend_mouse_context_menu hook.)
@@ -1151,7 +1225,12 @@ impl ReviewPanel {
             let subscription =
                 cx.subscribe(&editor, |this, _editor, event: &EditorEvent, cx| {
                     if let EditorEvent::BufferRangesUpdated { .. } = event {
-                        this.refresh_inline_comment_blocks(cx);
+                        // Only used to drive the reveal check while the diff is
+                        // held. We deliberately do NOT re-inject here: comments
+                        // are injected once at reveal, and their anchors stay
+                        // valid across later excerpt changes — re-injecting would
+                        // churn block heights and visibly reflow the diff.
+                        this.maybe_reveal_diff(cx);
                     }
                 });
             entry.insert(subscription);
@@ -1814,6 +1893,8 @@ impl ReviewPanel {
                             head_ref,
                             Some(project_path),
                             tab_label,
+                            // Navigating to a specific file post-load; don't re-hold.
+                            false,
                             window,
                             cx,
                         );
@@ -1824,16 +1905,36 @@ impl ReviewPanel {
             }
             PendingAction::SelectPullRequest(pr) => {
                 self.create_review_view(&pr, window, cx);
-                // Open the combined diff tab immediately (empty until the ref
-                // finishes fetching, after which load_diff's completion re-deploys
-                // to reload + navigate). Safe now that PR diffs don't auto-fold.
+                // Open the diff tab immediately, held behind the loading state, so
+                // the loading window appears instantly. It's empty until the ref
+                // is fetched; `maybe_open_pr_diff` re-deploys (existing-tab reload)
+                // once the tree is ready, and it's revealed once files + comments
+                // are loaded.
                 if let Some(workspace) = self._workspace.upgrade() {
                     let base_ref = pr.base_sha.clone();
                     let head_ref = Some(pr.head_sha.clone());
                     let tab_label = Some(SharedString::from(format!("#{}", pr.number)));
                     workspace.update(cx, |workspace, cx| {
                         git_ui::project_diff::ProjectDiff::deploy_merge_diff(
-                            workspace, base_ref, head_ref, None, tab_label, window, cx,
+                            workspace, base_ref, head_ref, None, tab_label, true, window, cx,
+                        );
+                    });
+                }
+            }
+            PendingAction::OpenPrDiff => {
+                let Some(pr) = self.selected_pr.as_ref() else {
+                    return;
+                };
+                if let Some(workspace) = self._workspace.upgrade() {
+                    let base_ref = pr.base_sha.clone();
+                    let head_ref = Some(pr.head_sha.clone());
+                    let tab_label = Some(SharedString::from(format!("#{}", pr.number)));
+                    workspace.update(cx, |workspace, cx| {
+                        // `None` path → opens at Anchor::Min (top of the first
+                        // file) with no navigation. Held (review_loading=true)
+                        // until files load and comments inject, then revealed.
+                        git_ui::project_diff::ProjectDiff::deploy_merge_diff(
+                            workspace, base_ref, head_ref, None, tab_label, true, window, cx,
                         );
                     });
                 }
