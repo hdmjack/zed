@@ -1,6 +1,6 @@
 use crate::configuration_view::{ConfigurationEvent, ConfigurationView};
 use crate::github_provider::GitHubProvider;
-use crate::inline_comment::{ApplySuggestion, ReactToComment, comment_markdown, parse_suggestions, render_pr_comment_block, SuggestionBlock};
+use crate::inline_comment::{ApplySuggestion, ReactToComment, SuggestionBlock, comment_markdown, parse_suggestions, render_pr_comment_block};
 use crate::pull_request_list::{PullRequestList, PullRequestListEvent, RemoteState};
 use crate::review_view::{ReviewView, ReviewViewEvent};
 use git_hosting_providers::resolve_github_token;
@@ -2194,11 +2194,25 @@ fn render_comment_thread_with_reply(
                 }),
         );
     } else if let Some(root_id) = root_id {
+        // A persistent muted "Reply…" field (reads as an input affordance, not a
+        // heading) that expands the composer in place when clicked.
         container = container.child(
-            h_flex().pl(anchor_x).pb_1().child(
-                Button::new(("inline-reply", root_id as usize), "Reply")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::Small)
+            h_flex().pl(anchor_x).pr_2().pb_1().child(
+                div()
+                    .id(("inline-reply", root_id as usize))
+                    .w_full()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(colors.ghost_element_hover))
+                    .child(
+                        Label::new("Reply…")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
                     .on_click(move |_, window, cx| {
                         let weak_editor = weak_editor.clone();
                         weak_panel
@@ -2250,7 +2264,7 @@ impl RenderOnce for ComposerBubble {
             .gap_2()
             .rounded_md()
             .border_1()
-            .border_color(colors.border_variant)
+            .border_color(colors.border)
             .bg(colors.element_background)
             .key_context("ReviewComposer")
             .on_action(move |_: &SubmitComment, _window, cx| {

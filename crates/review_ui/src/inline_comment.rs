@@ -1,12 +1,15 @@
-use crate::review_provider::{ReactionContent, ReviewComment};
+use crate::review_provider::{ReactionContent, ReactionGroup, ReviewComment};
 use editor::display_map::BlockContext;
-use gpui::{AnyElement, App, Entity, ImageSource, SharedString, px};
+use gpui::{
+    AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    ImageSource, Render, SharedString, Window, px,
+};
 use regex::Regex;
 use std::sync::LazyLock;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownOptions, MarkdownStyle};
 use ui::{
-    Avatar, Button, ButtonStyle, Color, ContextMenu, FluentBuilder, IconName, IntoElement, Label,
-    LabelSize, PopoverMenu, Tooltip, div, h_flex, prelude::*, v_flex,
+    Avatar, Button, ButtonStyle, Color, FluentBuilder, IconButton, IconName, IconSize, IntoElement,
+    Label, LabelSize, PopoverMenu, Tooltip, div, h_flex, prelude::*, v_flex,
 };
 
 #[derive(Clone, Debug)]
@@ -213,34 +216,44 @@ pub fn render_pr_comment_block(
     cx: &mut BlockContext,
 ) -> AnyElement {
     let colors = cx.theme().colors().clone();
-    let style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
+    let anchor_x = cx.anchor_x;
+    let max_width = cx.max_width;
+    let mut style = MarkdownStyle::themed(MarkdownFont::Editor, cx.window, cx.app);
+    // Flatten code/HTML blocks: drop the outlined-card border so a standalone
+    // literal matches the flat inline-code fill (in-buffer content is low-chrome).
+    // Long code lines scroll horizontally rather than clip.
+    style.code_block.border_widths = gpui::EdgesRefinement::default();
+    style.code_block.border_style = None;
+    style.code_block.background = Some(colors.element_background.into());
+    style.code_block_overflow_x_scroll = true;
 
     let mut container = v_flex()
         .w_full()
-        .max_w(cx.max_width - cx.anchor_x)
+        .max_w(max_width - anchor_x)
         .overflow_x_hidden()
-        .pl(cx.anchor_x)
         .pr_2()
         .py_1()
         .gap_1()
         .border_t_1()
         .border_b_1()
-        .border_color(colors.border)
+        .border_color(colors.border_variant)
         .bg(colors.editor_background);
 
     for (comment, markdown_entity, suggestions) in &comments {
         let is_reply = comment.reply_to.is_some();
+        // Reveal the reaction affordance in the left "gutter" cell on hover.
+        let hover_group = SharedString::from(format!("inline-comment-{}", comment.id));
+        let reaction_trigger = add_reaction_picker(comment, "inline", cx.app);
 
-        let mut row = v_flex()
-            .px_2()
+        let mut content = v_flex()
+            .flex_1()
+            .min_w_0()
             .py_1()
             .gap_0p5()
-            .rounded_md()
+            // Replies indent under a muted hairline guide (the editor's own
+            // indent-guide idiom), not a saturated accent rail.
             .when(is_reply, |el| {
-                el.ml_4()
-                    .border_l_2()
-                    .border_color(colors.border_focused)
-                    .pl_2()
+                el.border_l_1().border_color(colors.border_variant).pl_2()
             })
             .child(
                 h_flex()
@@ -272,14 +285,37 @@ pub fn render_pr_comment_block(
             );
 
         for suggestion in suggestions {
-            row = row.child(render_suggestion_block(suggestion, comment.id, cx));
+            content = content.child(render_suggestion_block(suggestion, comment.id, cx));
         }
 
-        if let Some(bar) = reaction_bar(comment, "inline", cx.app) {
-            row = row.child(bar);
+        // Existing reaction pills sit inline near the body (only when present).
+        if let Some(pills) = reaction_pills(comment, "inline", cx.app) {
+            content = content.child(pills);
         }
 
-        container = container.child(row);
+        // The "gutter" cell (aligned with the diff gutter, where the add-comment
+        // "+" lives) holds the hover-revealed ThumbsUp reaction trigger.
+        let gutter = div()
+            .flex_none()
+            .w(anchor_x)
+            .flex()
+            .justify_start()
+            // Align with the gutter "+" add-comment button, which the editor
+            // positions at ~git_gutter_width + 2px (≈ 0.275 * line_height + 2).
+            .pl_2()
+            .children(
+                reaction_trigger
+                    .map(|trigger| div().visible_on_hover(hover_group.clone()).child(trigger)),
+            );
+
+        container = container.child(
+            h_flex()
+                .group(hover_group)
+                .w_full()
+                .items_start()
+                .child(gutter)
+                .child(content),
+        );
     }
 
     container.into_any_element()
@@ -297,9 +333,10 @@ fn render_suggestion_block(
     v_flex()
         .id(suggestion_id)
         .mt_1()
-        .p_2()
-        .rounded_md()
-        .bg(colors.surface_background)
+        .pl_2()
+        .py_1()
+        // Flat on the editor background; a left accent hairline marks it as a
+        // suggestion (no rounded/tinted card).
         .border_l_2()
         .border_color(status.created)
         .child(
@@ -332,9 +369,10 @@ fn render_suggestion_block(
         .child(
             v_flex()
                 .mt_1()
-                .p_1()
-                .rounded_sm()
-                .bg(colors.editor_background)
+                .px_1()
+                // Flat buffer-font code run on a faint fill — the one justified
+                // fill (it's code), no outlined box.
+                .bg(colors.element_background)
                 .child(
                     Label::new(suggestion.suggested_code.clone())
                         .size(LabelSize::XSmall)
@@ -359,29 +397,25 @@ pub struct ReactToComment {
     pub add: bool,
 }
 
-/// A row of reaction pills (one per non-zero reaction) plus a "+" picker, shared
-/// by the sidebar comment card and the inline diff comment block. Both surfaces
-/// drive reactions by dispatching `ReactToComment`, so this needs no entity
-/// handle. Returns `None` for comments without a node id (e.g. a just-posted
-/// comment that hasn't been reloaded), which can't be reacted to yet.
-pub fn reaction_bar(comment: &ReviewComment, surface: &str, cx: &mut App) -> Option<AnyElement> {
-    if comment.node_id.is_empty() {
-        return None;
-    }
+/// The reaction pills (one per non-zero reaction) for a comment. `None` when the
+/// comment has no reactions to show. Clicking a pill toggles that reaction.
+pub fn reaction_pills(comment: &ReviewComment, surface: &str, cx: &mut App) -> Option<AnyElement> {
     let comment_id = comment.id;
     let colors = cx.theme().colors().clone();
 
     let mut bar = h_flex().flex_wrap().gap_1().items_center();
+    let mut any = false;
     for group in &comment.reactions {
         if group.count == 0 {
             continue;
         }
+        any = true;
         let content = group.content;
         let add = !group.viewer_reacted;
         let (background, border) = if group.viewer_reacted {
             (colors.element_selected, colors.border_focused)
         } else {
-            (colors.element_background, colors.border)
+            (colors.ghost_element_background, colors.border)
         };
         bar = bar.child(
             div()
@@ -418,45 +452,134 @@ pub fn reaction_bar(comment: &ReviewComment, surface: &str, cx: &mut App) -> Opt
         );
     }
 
+    any.then(|| bar.into_any_element())
+}
+
+/// The "Add reaction" picker: a muted `ThumbsUp` icon trigger opening the emoji
+/// menu. `None` for comments without a node id (e.g. a just-posted comment that
+/// hasn't been reloaded), which can't be reacted to yet.
+pub fn add_reaction_picker(
+    comment: &ReviewComment,
+    surface: &str,
+    _cx: &mut App,
+) -> Option<AnyElement> {
+    if comment.node_id.is_empty() {
+        return None;
+    }
+    let comment_id = comment.id;
     let reactions = comment.reactions.clone();
     let picker = PopoverMenu::new(SharedString::from(format!(
         "react-picker-{surface}-{comment_id}"
     )))
-        .trigger(
-            Button::new(
-                SharedString::from(format!("react-add-{surface}-{comment_id}")),
-                "Add reaction",
-            )
-            .label_size(LabelSize::Small)
-            .color(Color::Muted)
-            .style(ButtonStyle::Subtle),
+    .trigger(
+        IconButton::new(
+            SharedString::from(format!("react-add-{surface}-{comment_id}")),
+            IconName::ThumbsUp,
         )
-        .menu(move |window, cx| {
-            let reactions = reactions.clone();
-            Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
-                for content in ReactionContent::ALL {
-                    let already = reactions
-                        .iter()
-                        .any(|group| group.content == content && group.viewer_reacted);
-                    let add = !already;
-                    menu = menu.entry(
-                        format!("{}  {}", content.emoji(), content.label()),
-                        None,
-                        move |window, cx| {
-                            window.dispatch_action(
-                                Box::new(ReactToComment {
-                                    comment_id,
-                                    content: content.graphql().to_string(),
-                                    add,
-                                }),
-                                cx,
-                            );
-                        },
-                    );
-                }
-                menu
-            }))
-        });
+        // XSmall + Transparent matches the gutter "+" add-comment button so the
+        // two line up vertically in the gutter.
+        .icon_size(IconSize::XSmall)
+        .icon_color(Color::Muted)
+        .style(ButtonStyle::Transparent)
+        .tooltip(Tooltip::text("Add reaction")),
+    )
+    .menu(move |_window, cx| {
+        let reactions = reactions.clone();
+        Some(cx.new(|cx| ReactionPicker::new(comment_id, reactions, cx)))
+    });
+    Some(picker.into_any_element())
+}
 
-    Some(bar.child(picker).into_any_element())
+/// The emoji-grid popover shown by the "Add reaction" trigger: a compact grid of
+/// the supported emojis (no labels). Clicking one toggles that reaction and
+/// dismisses the popover.
+struct ReactionPicker {
+    comment_id: u64,
+    reactions: Vec<ReactionGroup>,
+    focus_handle: FocusHandle,
+}
+
+impl ReactionPicker {
+    fn new(comment_id: u64, reactions: Vec<ReactionGroup>, cx: &mut App) -> Self {
+        Self {
+            comment_id,
+            reactions,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+}
+
+impl Focusable for ReactionPicker {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<DismissEvent> for ReactionPicker {}
+
+impl Render for ReactionPicker {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let comment_id = self.comment_id;
+        h_flex()
+            // Capture focus + dismiss when the user clicks outside the popover.
+            .track_focus(&self.focus_handle)
+            .on_mouse_down_out(cx.listener(|_this, _event, _window, cx| {
+                cx.emit(DismissEvent);
+            }))
+            // Popover surface chrome (background + border + rounding + shadow).
+            .elevation_2(cx)
+            .p_1()
+            .gap_0p5()
+            .flex_wrap()
+            // Cap the width so the eight emojis wrap into a grid rather than a
+            // single long row.
+            .max_w(px(148.0))
+            .children(ReactionContent::ALL.into_iter().map(|content| {
+                let already = self
+                    .reactions
+                    .iter()
+                    .any(|group| group.content == content && group.viewer_reacted);
+                let add = !already;
+                div()
+                    .id(SharedString::from(format!("react-grid-{}", content.graphql())))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(28.0))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(already, |el| el.bg(colors.element_selected))
+                    .tooltip(Tooltip::text(content.label()))
+                    .child(Label::new(content.emoji()))
+                    .on_click(cx.listener(move |_this, _event, window, cx| {
+                        window.dispatch_action(
+                            Box::new(ReactToComment {
+                                comment_id,
+                                content: content.graphql().to_string(),
+                                add,
+                            }),
+                            cx,
+                        );
+                        cx.emit(DismissEvent);
+                    }))
+            }))
+    }
+}
+
+/// Reaction pills followed by the "Add reaction" picker, on one row — used by the
+/// sidebar comment card. (The inline thread renders the pills per-comment and the
+/// picker in the thread footer next to "Reply" instead.)
+pub fn reaction_bar(comment: &ReviewComment, surface: &str, cx: &mut App) -> Option<AnyElement> {
+    let pills = reaction_pills(comment, surface, cx);
+    let picker = add_reaction_picker(comment, surface, cx)?;
+    Some(
+        h_flex()
+            .flex_wrap()
+            .gap_1()
+            .items_center()
+            .children(pills)
+            .child(picker)
+            .into_any_element(),
+    )
 }
