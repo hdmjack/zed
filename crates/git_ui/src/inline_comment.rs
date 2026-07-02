@@ -1,4 +1,4 @@
-use crate::review_provider::{ReactionContent, ReactionGroup, ReviewComment};
+use pull_request::{ReactionContent, ReactionGroup, ReviewComment};
 use editor::display_map::BlockContext;
 use gpui::{
     AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,

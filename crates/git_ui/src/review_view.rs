@@ -1,6 +1,6 @@
 use crate::comment_card::{CommentCard, CommentPreview};
 use crate::file_list::{DisplayEntry, ViewMode, build_file_tree, flatten_file_tree};
-use crate::review_provider::{
+use pull_request::{
     CheckRollup, CommentReactions, FileChangeStatus, MergeMethod, PullRequestFile,
     PullRequestInfo, PullRequestStatus, ReactionContent, ReactionGroup, ReviewComment,
     ReviewProvider, ReviewStatus,
@@ -128,6 +128,10 @@ pub struct ReviewView {
     general_comments: Vec<ReviewComment>,
     file_rows: Vec<RowKind>,
     comment_rows: Vec<RowKind>,
+    /// Index into `file_rows` of the keyboard-selected file row, if any. Only
+    /// `RowKind::File` rows are selectable; drives the neutral highlight and
+    /// what `open_selected_file` / `toggle_selected_file_viewed` act on.
+    selected_file_row: Option<usize>,
 }
 
 /// One flattened, virtualizable row in the review scroll area.
@@ -281,6 +285,7 @@ impl ReviewView {
             general_comments: Vec::new(),
             file_rows: Vec::new(),
             comment_rows: Vec::new(),
+            selected_file_row: None,
         };
         this.load_pr_comments(pr_number, cx);
         this.load_pr_api_files(pr_number, cx);
@@ -400,6 +405,93 @@ impl ReviewView {
 
     pub fn is_tree_view(&self) -> bool {
         self.view_mode == ViewMode::Tree
+    }
+
+    /// Indices of selectable (file) rows in `file_rows`, in display order.
+    fn file_row_indices(&self) -> Vec<usize> {
+        self.file_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, row)| matches!(row, RowKind::File { .. }).then_some(ix))
+            .collect()
+    }
+
+    fn set_selected_file_row(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
+        self.selected_file_row = row;
+        if let Some(row) = row {
+            self.file_list_state.scroll_to_reveal_item(row);
+        }
+        cx.notify();
+    }
+
+    pub fn select_next_file(&mut self, cx: &mut Context<Self>) {
+        let files = self.file_row_indices();
+        if files.is_empty() {
+            return;
+        }
+        let next = match self.selected_file_row {
+            Some(current) => files
+                .iter()
+                .find(|&&ix| ix > current)
+                .copied()
+                .unwrap_or(*files.last().expect("non-empty")),
+            None => files[0],
+        };
+        self.set_selected_file_row(Some(next), cx);
+    }
+
+    pub fn select_previous_file(&mut self, cx: &mut Context<Self>) {
+        let files = self.file_row_indices();
+        if files.is_empty() {
+            return;
+        }
+        let previous = match self.selected_file_row {
+            Some(current) => files
+                .iter()
+                .rev()
+                .find(|&&ix| ix < current)
+                .copied()
+                .unwrap_or(files[0]),
+            None => files[0],
+        };
+        self.set_selected_file_row(Some(previous), cx);
+    }
+
+    pub fn select_first_file(&mut self, cx: &mut Context<Self>) {
+        if let Some(&first) = self.file_row_indices().first() {
+            self.set_selected_file_row(Some(first), cx);
+        }
+    }
+
+    pub fn select_last_file(&mut self, cx: &mut Context<Self>) {
+        if let Some(&last) = self.file_row_indices().last() {
+            self.set_selected_file_row(Some(last), cx);
+        }
+    }
+
+    /// Open the diff for the keyboard-selected file (Enter), falling back to the
+    /// first file when nothing is explicitly selected.
+    pub fn open_selected_file(&mut self, cx: &mut Context<Self>) {
+        let row = self
+            .selected_file_row
+            .or_else(|| self.file_row_indices().first().copied());
+        if let Some(row) = row
+            && let Some(RowKind::File { path, .. }) = self.file_rows.get(row)
+            && let Ok(repo_path) = RepoPath::new(path.as_ref())
+        {
+            self.selected_file_row = Some(row);
+            cx.emit(ReviewViewEvent::OpenFileDiff(repo_path));
+        }
+    }
+
+    /// Toggle the viewed state of the keyboard-selected file (Space).
+    pub fn toggle_selected_file_viewed(&mut self, cx: &mut Context<Self>) {
+        if let Some(row) = self.selected_file_row
+            && let Some(RowKind::File { path, .. }) = self.file_rows.get(row)
+        {
+            let path = path.clone();
+            self.toggle_file_viewed(path, cx);
+        }
     }
 
     pub fn toggle_tree_view(&mut self, cx: &mut Context<Self>) {
@@ -771,6 +863,13 @@ impl ReviewView {
             }
         }
         self.file_rows = file_rows;
+        // Drop the keyboard selection if the rebuilt rows no longer have a file
+        // at that index (view-mode switch, reload, folded directory, …).
+        if let Some(row) = self.selected_file_row
+            && !matches!(self.file_rows.get(row), Some(RowKind::File { .. }))
+        {
+            self.selected_file_row = None;
+        }
 
         // Bottom panel: all comment threads, grouped by file (in tree order),
         // followed by the general conversation comments.
@@ -1466,6 +1565,7 @@ impl ReviewView {
                         })
                     });
 
+                let is_selected = self.selected_file_row == Some(ix);
                 let file_row = h_flex()
                     .id(SharedString::from(format!("pr_file_{}", ix)))
                     .px_2()
@@ -1474,6 +1574,9 @@ impl ReviewView {
                     .gap_2()
                     .rounded_md()
                     .cursor_pointer()
+                    .when(is_selected, |row| {
+                        row.bg(cx.theme().colors().element_selected)
+                    })
                     .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
                     .pl(px(indent))
                     .child(viewed_checkbox)

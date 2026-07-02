@@ -62,8 +62,19 @@ pub mod worktree_names;
 pub mod worktree_picker;
 pub mod worktree_service;
 
+// PR review (relocated from the former `review_ui` crate).
+mod comment_card;
+mod configuration_view;
+mod file_list;
+mod inline_comment;
+mod pull_request_list;
+mod review_panel;
+mod review_panel_settings;
+mod review_view;
+
 pub use blame_ui::GitBlameStatus;
 pub use conflict_view::MergeConflictIndicator;
+pub use review_panel::ReviewPanel;
 
 pub fn get_provider_icon(name: &str) -> IconName {
     match name {
@@ -95,6 +106,7 @@ pub fn init(cx: &mut App) {
         git_panel::register(workspace);
         repository_selector::register(workspace);
         git_picker::register(workspace);
+        review_panel::register(workspace);
 
         workspace.register_action(
             |workspace, action: &zed_actions::CreateWorktree, window, cx| {

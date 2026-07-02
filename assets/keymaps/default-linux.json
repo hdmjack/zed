@@ -182,6 +182,20 @@
     },
   },
   {
+    "context": "ReviewPanel",
+    "bindings": {
+      "ctrl-1": "review_ui::ActivatePullRequestsTab",
+      "ctrl-2": "review_ui::ActivateConfigurationTab",
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "ctrl-up": "menu::SelectFirst",
+      "ctrl-down": "menu::SelectLast",
+      "enter": "menu::Confirm",
+      "space": "review_ui::ToggleViewed",
+      "escape": "review_ui::ToggleFocus",
+    },
+  },
+  {
     "context": "Markdown",
     "bindings": {
       "copy": "markdown::Copy",

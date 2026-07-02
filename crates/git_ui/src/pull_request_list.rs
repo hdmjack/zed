@@ -1,4 +1,4 @@
-use crate::review_provider::{
+use pull_request::{
     CheckRollup, PullRequestInfo, PullRequestState, ReviewProvider, ReviewStatus,
 };
 use editor::{Editor, EditorEvent};
@@ -61,6 +61,9 @@ pub struct PullRequestList {
     filter_menu_handle: PopoverMenuHandle<ContextMenu>,
     search_editor: Entity<Editor>,
     scroll_handle: UniformListScrollHandle,
+    /// Index into `filtered` of the keyboard-selected row, if any. Drives the
+    /// neutral selection highlight and is what `confirm_selected` opens.
+    selected_index: Option<usize>,
 }
 
 impl EventEmitter<PullRequestListEvent> for PullRequestList {}
@@ -111,6 +114,7 @@ impl PullRequestList {
             filter_menu_handle: PopoverMenuHandle::default(),
             search_editor,
             scroll_handle: UniformListScrollHandle::new(),
+            selected_index: None,
         }
     }
 
@@ -133,6 +137,72 @@ impl PullRequestList {
             })
             .cloned()
             .collect();
+        // Keep the keyboard selection in range as the visible set changes.
+        self.selected_index = match self.selected_index {
+            Some(_) if self.filtered.is_empty() => None,
+            Some(index) => Some(index.min(self.filtered.len() - 1)),
+            None => None,
+        };
+    }
+
+    /// Row navigation (Pattern A picker semantics). All clamp to `filtered`,
+    /// scroll the selection into view, and repaint.
+    pub fn select_next(&mut self, cx: &mut Context<Self>) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        let next = match self.selected_index {
+            Some(index) => (index + 1).min(self.filtered.len() - 1),
+            None => 0,
+        };
+        self.set_selected_index(Some(next), cx);
+    }
+
+    pub fn select_previous(&mut self, cx: &mut Context<Self>) {
+        if self.filtered.is_empty() {
+            return;
+        }
+        let previous = match self.selected_index {
+            Some(index) => index.saturating_sub(1),
+            None => 0,
+        };
+        self.set_selected_index(Some(previous), cx);
+    }
+
+    pub fn select_first(&mut self, cx: &mut Context<Self>) {
+        if !self.filtered.is_empty() {
+            self.set_selected_index(Some(0), cx);
+        }
+    }
+
+    pub fn select_last(&mut self, cx: &mut Context<Self>) {
+        if !self.filtered.is_empty() {
+            self.set_selected_index(Some(self.filtered.len() - 1), cx);
+        }
+    }
+
+    fn set_selected_index(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        self.selected_index = index;
+        if let Some(index) = index {
+            self.scroll_handle.scroll_to_item(index, gpui::ScrollStrategy::Nearest);
+        }
+        cx.notify();
+    }
+
+    /// Open the keyboard-selected PR (Enter). Falls back to the first row when
+    /// nothing is explicitly selected yet, so Enter is always meaningful.
+    pub fn confirm_selected(&mut self, cx: &mut Context<Self>) {
+        let index = self.selected_index.or(if self.filtered.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
+        if let Some(index) = index
+            && let Some(pr) = self.filtered.get(index).cloned()
+        {
+            self.selected_index = Some(index);
+            cx.emit(PullRequestListEvent::Selected(pr));
+        }
     }
 
     pub fn set_provider(
@@ -454,6 +524,8 @@ impl PullRequestList {
                 )
             });
 
+        let is_selected = self.selected_index == Some(ix);
+
         h_flex()
             .id(SharedString::from(format!("pr_{}", number)))
             .px_2()
@@ -462,6 +534,9 @@ impl PullRequestList {
             .gap_2()
             .rounded_md()
             .cursor_pointer()
+            .when(is_selected, |row| {
+                row.bg(cx.theme().colors().element_selected)
+            })
             .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
             .child(Avatar::new(crate::review_view::avatar_url(&author)).size(px(18.0)))
             .child(
@@ -537,7 +612,8 @@ impl PullRequestList {
                             }),
                     ),
             )
-            .on_click(cx.listener(move |_this, _event, _window, cx| {
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                this.selected_index = Some(ix);
                 cx.emit(PullRequestListEvent::Selected(pr.clone()));
             }))
             .into_any_element()
@@ -675,6 +751,17 @@ impl Render for PullRequestList {
             PullRequestState::All => "All",
         };
         let filtered_count = self.filtered.len();
+
+        // Loaded PRs exist, but the current search/drafts filter hides them all.
+        // Quiet, muted no-results line (Pattern A) — not error styling.
+        if filtered_count == 0 {
+            return v_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .child(Label::new("No matching pull requests").color(Color::Muted))
+                .into_any_element();
+        }
 
         v_flex()
             .id("review-pr-list")

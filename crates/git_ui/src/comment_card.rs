@@ -1,4 +1,4 @@
-use crate::review_provider::ReviewComment;
+use pull_request::ReviewComment;
 use gpui::{Entity, TextStyleRefinement, px};
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use ui::{Avatar, Color, IntoElement, Label, LabelSize, Tooltip, div, h_flex, prelude::*, v_flex};

@@ -766,7 +766,13 @@ pub mod review_panel {
             /// Adds a PR review comment on the current line or selection.
             AddComment,
             /// Submits the focused PR comment composer.
-            SubmitComment
+            SubmitComment,
+            /// Activates the pull requests tab.
+            ActivatePullRequestsTab,
+            /// Activates the configuration tab.
+            ActivateConfigurationTab,
+            /// Toggles the viewed state of the selected file in a PR review.
+            ToggleViewed
         ]
     );
 }

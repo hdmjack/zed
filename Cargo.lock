@@ -7372,6 +7372,7 @@ dependencies = [
  "call",
  "collections",
  "component",
+ "credentials_provider",
  "ctor",
  "db",
  "editor",
@@ -7382,7 +7383,9 @@ dependencies = [
  "fuzzy",
  "fuzzy_nucleo",
  "git",
+ "git_hosting_providers",
  "gpui",
+ "http_client",
  "indoc",
  "itertools 0.14.0",
  "language",
@@ -7398,7 +7401,9 @@ dependencies = [
  "project",
  "prompt_store",
  "proto",
+ "pull_request",
  "rand 0.9.4",
+ "regex",
  "release_channel",
  "remote",
  "remote_connection",
@@ -7408,11 +7413,13 @@ dependencies = [
  "serde_json",
  "settings",
  "smallvec",
+ "smol",
  "strum 0.27.2",
  "sysinfo 0.37.2",
  "task",
  "telemetry",
  "terminal",
+ "text",
  "theme",
  "theme_settings",
  "time",
@@ -7426,6 +7433,7 @@ dependencies = [
  "windows 0.61.3",
  "workspace",
  "zed_actions",
+ "zed_credentials_provider",
  "zeroize",
  "zlog",
  "ztracing",
@@ -14403,6 +14411,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pull_request"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures 0.3.32",
+ "gpui",
+ "http_client",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pulldown-cmark"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15397,44 +15417,6 @@ dependencies = [
  "tiny-skia",
  "usvg",
  "zune-jpeg",
-]
-
-[[package]]
-name = "review_ui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "collections",
- "credentials_provider",
- "db",
- "editor",
- "fs",
- "futures 0.3.32",
- "git",
- "git_hosting_providers",
- "git_ui",
- "gpui",
- "http_client",
- "language",
- "log",
- "markdown",
- "menu",
- "multi_buffer",
- "project",
- "regex",
- "schemars 1.0.4",
- "serde",
- "serde_json",
- "settings",
- "smol",
- "text",
- "time",
- "time_format",
- "ui",
- "util",
- "workspace",
- "zed_actions",
- "zed_credentials_provider",
 ]
 
 [[package]]
@@ -23133,7 +23115,6 @@ dependencies = [
  "remote",
  "repl",
  "reqwest_client",
- "review_ui",
  "rope",
  "sandbox",
  "search",

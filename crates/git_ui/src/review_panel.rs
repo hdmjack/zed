@@ -1,11 +1,11 @@
 use crate::configuration_view::{ConfigurationEvent, ConfigurationView};
-use crate::github_provider::GitHubProvider;
+use pull_request::GitHubProvider;
 use crate::inline_comment::{ApplySuggestion, ReactToComment, SuggestionBlock, comment_markdown, parse_suggestions, render_pr_comment_block};
 use crate::pull_request_list::{PullRequestList, PullRequestListEvent, RemoteState};
 use crate::review_view::{ReviewView, ReviewViewEvent};
 use git_hosting_providers::resolve_github_token;
 use crate::review_panel_settings::ReviewPanelSettings;
-use crate::review_provider::{PullRequestInfo, ReactionContent, ReviewComment, ReviewProvider};
+use pull_request::{PullRequestInfo, ReactionContent, ReviewComment, ReviewProvider};
 use markdown::Markdown;
 use anyhow::Result;
 use collections::HashMap;
@@ -40,7 +40,10 @@ use workspace::{
     SERIALIZATION_THROTTLE_TIME, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
-use zed_actions::review_panel::{AddComment, SubmitComment, ToggleFocus};
+use zed_actions::review_panel::{
+    ActivateConfigurationTab, ActivatePullRequestsTab, AddComment, SubmitComment, ToggleFocus,
+    ToggleViewed,
+};
 
 const REVIEW_PANEL_KEY: &str = "ReviewPanel";
 
@@ -62,9 +65,12 @@ struct RecentReview {
     pull_request: Option<PullRequestInfo>,
 }
 
-enum ActiveView {
-    PullRequestList,
-    ReviewThread,
+/// Top-level dock navigation, mirroring `GitPanel`'s tab model (Changes |
+/// History). Reviewing a specific PR is a drill-down *within* the Pull Requests
+/// tab (tracked by `ReviewPanel::reviewing`), not a separate tab.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReviewPanelTab {
+    PullRequests,
     Configuration,
 }
 
@@ -89,7 +95,10 @@ pub struct ReviewPanel {
     recent_reviews_menu_handle: PopoverMenuHandle<ContextMenu>,
     options_menu_handle: PopoverMenuHandle<ContextMenu>,
     fs: Arc<dyn Fs>,
-    active_view: ActiveView,
+    active_tab: ReviewPanelTab,
+    /// Whether the Pull Requests tab is drilled into a specific PR's review
+    /// (the file/thread view) rather than showing the list.
+    reviewing: bool,
     recent_reviews: Vec<RecentReview>,
     http_client: Arc<dyn HttpClient>,
     pull_request_list: Option<(Entity<PullRequestList>, Subscription)>,
@@ -104,7 +113,7 @@ pub struct ReviewPanel {
     pr_diff_opened: bool,
     /// Handle to the open PR diff, used to release its loading gate once the
     /// diff is fully loaded and comments are injected.
-    pr_diff: Option<WeakEntity<git_ui::project_diff::ProjectDiff>>,
+    pr_diff: Option<WeakEntity<crate::project_diff::ProjectDiff>>,
     /// Observes the PR diff so we re-check the reveal gate when it finishes
     /// loading (its final load completion isn't an editor event we'd otherwise see).
     pr_diff_subscription: Option<Subscription>,
@@ -341,7 +350,8 @@ impl ReviewPanel {
             fs,
             recent_reviews_menu_handle: PopoverMenuHandle::default(),
             options_menu_handle: PopoverMenuHandle::default(),
-            active_view: ActiveView::PullRequestList,
+            active_tab: ReviewPanelTab::PullRequests,
+            reviewing: false,
             recent_reviews: Vec::new(),
             http_client: workspace.client().http_client(),
             pull_request_list: None,
@@ -437,9 +447,88 @@ impl ReviewPanel {
         });
     }
 
-    fn set_active_view(&mut self, new_view: ActiveView, cx: &mut Context<Self>) {
-        self.active_view = new_view;
-        cx.notify();
+    /// True when the Pull Requests tab is showing the list (not drilled into a
+    /// PR review). Drives whether roving-selection nav is forwarded to the list.
+    fn showing_list(&self) -> bool {
+        matches!(self.active_tab, ReviewPanelTab::PullRequests) && !self.reviewing
+    }
+
+    /// True when the Pull Requests tab is drilled into a specific PR's review.
+    fn showing_review(&self) -> bool {
+        matches!(self.active_tab, ReviewPanelTab::PullRequests) && self.reviewing
+    }
+
+    fn activate_tab(&mut self, tab: ReviewPanelTab, window: &mut Window, cx: &mut Context<Self>) {
+        match tab {
+            ReviewPanelTab::PullRequests => {
+                // Return to the Pull Requests tab, preserving any in-progress
+                // drill-down (the `reviewing` flag is untouched).
+                self.active_tab = ReviewPanelTab::PullRequests;
+                // Reclaim focus so roving keyboard nav is live on the list.
+                if !self.reviewing {
+                    window.focus(&self.focus_handle, cx);
+                }
+                cx.notify();
+            }
+            ReviewPanelTab::Configuration => {
+                self.open_configuration(window, cx);
+            }
+        }
+    }
+
+    fn activate_pull_requests_tab(
+        &mut self,
+        _: &ActivatePullRequestsTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_tab(ReviewPanelTab::PullRequests, window, cx);
+    }
+
+    fn activate_configuration_tab(
+        &mut self,
+        _: &ActivateConfigurationTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_tab(ReviewPanelTab::Configuration, window, cx);
+    }
+
+    fn render_tab_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tab = |id: &'static str,
+                   label: &'static str,
+                   tab: ReviewPanelTab,
+                   cx: &mut Context<Self>| {
+            Button::new(id, label)
+                .style(ui::ButtonStyle::Subtle)
+                .toggle_state(self.active_tab == tab)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.activate_tab(tab, window, cx);
+                }))
+        };
+
+        h_flex()
+            .flex_none()
+            .w_full()
+            .h(Tab::container_height(cx))
+            .gap(DynamicSpacing::Base02.rems(cx))
+            .px(DynamicSpacing::Base04.rems(cx))
+            .bg(cx.theme().colors().tab_bar_background)
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(tab(
+                "review-tab-prs",
+                "Pull Requests",
+                ReviewPanelTab::PullRequests,
+                cx,
+            ))
+            .child(tab(
+                "review-tab-config",
+                "Configuration",
+                ReviewPanelTab::Configuration,
+                cx,
+            ))
+            .into_any_element()
     }
 
     fn refresh_pull_requests(&mut self, cx: &mut Context<Self>) {
@@ -521,16 +610,16 @@ impl ReviewPanel {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let weak_panel = cx.weak_entity();
-        let show_tree_toggle = matches!(self.active_view, ActiveView::ReviewThread);
-        let is_tree_view = match &self.active_view {
-            ActiveView::ReviewThread => self
-                .review_view
+        let show_tree_toggle = self.showing_review();
+        let is_tree_view = if self.showing_review() {
+            self.review_view
                 .as_ref()
                 .map(|(rv, _)| rv.read(cx).is_tree_view())
-                .unwrap_or(false),
-            _ => false,
+                .unwrap_or(false)
+        } else {
+            false
         };
-        let is_review_thread = matches!(self.active_view, ActiveView::ReviewThread);
+        let is_review_thread = self.showing_review();
 
         PopoverMenu::new("review-options-menu")
             .trigger_with_tooltip(
@@ -619,61 +708,62 @@ impl ReviewPanel {
             .child(self.render_recent_reviews_menu(cx))
             .child(self.render_options_menu(window, cx));
 
-        match self.active_view {
-            ActiveView::PullRequestList => {
-                let filter_bar = self
-                    .pull_request_list
-                    .as_ref()
-                    .map(|(list, _)| list.update(cx, |list, cx| list.render_filter_bar(cx)));
-                Some(
-                    bar.child(div().flex_1().children(filter_bar))
-                        .child(
-                            actions.child(
-                                IconButton::new("new-review", IconName::Plus)
-                                    .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("New Review"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.show_pull_request_list(window, cx);
-                                    })),
-                            ),
-                        )
-                        .into_any_element(),
+        if self.showing_review() {
+            let title = self.selected_pr.as_ref().map(|pr| {
+                (SharedString::from(format!("#{}", pr.number)), pr.title.clone())
+            });
+            return Some(
+                bar.child(
+                    IconButton::new("back-to-pr-list", IconName::ArrowLeft)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Back to pull requests"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close_review(window, cx);
+                        })),
                 )
-            }
-            ActiveView::ReviewThread => {
-                let title = self.selected_pr.as_ref().map(|pr| {
-                    (SharedString::from(format!("#{}", pr.number)), pr.title.clone())
-                });
-                Some(
-                    bar.child(
-                        IconButton::new("back-to-pr-list", IconName::ArrowLeft)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Back to pull requests"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.close_review(window, cx);
-                            })),
-                    )
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .gap_1()
-                            .overflow_x_hidden()
-                            .items_center()
-                            .when_some(title, |row, (number, pr_title)| {
-                                row.child(Label::new(number).color(Color::Muted))
-                                    .child(
-                                        div().overflow_x_hidden().flex_1().child(
-                                            Label::new(pr_title).single_line(),
-                                        ),
-                                    )
-                            }),
-                    )
-                    .child(actions)
-                    .into_any_element(),
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .gap_1()
+                        .overflow_x_hidden()
+                        .items_center()
+                        .when_some(title, |row, (number, pr_title)| {
+                            row.child(Label::new(number).color(Color::Muted)).child(
+                                div()
+                                    .overflow_x_hidden()
+                                    .flex_1()
+                                    .child(Label::new(pr_title).single_line()),
+                            )
+                        }),
                 )
-            }
-            ActiveView::Configuration => None,
+                .child(actions)
+                .into_any_element(),
+            );
         }
+
+        if self.showing_list() {
+            let filter_bar = self
+                .pull_request_list
+                .as_ref()
+                .map(|(list, _)| list.update(cx, |list, cx| list.render_filter_bar(cx)));
+            return Some(
+                bar.child(div().flex_1().children(filter_bar))
+                    .child(
+                        actions.child(
+                            IconButton::new("new-review", IconName::Plus)
+                                .icon_size(IconSize::Small)
+                                .tooltip(Tooltip::text("New Review"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.show_pull_request_list(window, cx);
+                                })),
+                        ),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        // Configuration tab: the tab bar is the only chrome; no sub-header.
+        None
     }
 
     fn set_remote_state(&mut self, state: RemoteState, cx: &mut Context<Self>) {
@@ -754,7 +844,9 @@ impl ReviewPanel {
 
         self.fetch_pr_ref(pr.number, cx);
         self.pending_action = Some(PendingAction::SelectPullRequest(pr.clone()));
-        self.set_active_view(ActiveView::ReviewThread, cx);
+        self.active_tab = ReviewPanelTab::PullRequests;
+        self.reviewing = true;
+        cx.notify();
         self.serialize(cx);
     }
 
@@ -1023,7 +1115,12 @@ impl ReviewPanel {
             pr_list.update(cx, |list, cx| list.load_if_empty(cx));
         }
 
-        self.active_view = ActiveView::PullRequestList;
+        self.active_tab = ReviewPanelTab::PullRequests;
+        self.reviewing = false;
+        // Reviewing a PR moves focus to the center-pane diff; returning to the
+        // list must reclaim focus so the `ReviewPanel` key context is active and
+        // roving keyboard navigation works again.
+        window.focus(&self.focus_handle, cx);
         self.serialize(cx);
         cx.notify();
     }
@@ -1059,16 +1156,18 @@ impl ReviewPanel {
                 // Rebuild the provider with the new token (set_provider reloads
                 // the list) and return to the pull request list.
                 this.initialize_provider(cx);
-                this.active_view = ActiveView::PullRequestList;
+                this.active_tab = ReviewPanelTab::PullRequests;
+                this.reviewing = false;
                 cx.notify();
             }
             ConfigurationEvent::Back => {
-                this.active_view = ActiveView::PullRequestList;
+                this.active_tab = ReviewPanelTab::PullRequests;
+                this.reviewing = false;
                 cx.notify();
             }
         });
         self.configuration_view = Some((view, subscription));
-        self.active_view = ActiveView::Configuration;
+        self.active_tab = ReviewPanelTab::Configuration;
         cx.notify();
     }
 
@@ -1277,7 +1376,7 @@ impl ReviewPanel {
         // diff is fully loaded and comments are injected. Observe it so the
         // load-completion notify re-checks the reveal gate.
         if self.pr_diff.is_none() {
-            if let Some(diff) = item.downcast::<git_ui::project_diff::ProjectDiff>() {
+            if let Some(diff) = item.downcast::<crate::project_diff::ProjectDiff>() {
                 self.pr_diff = Some(diff.downgrade());
                 self.pr_diff_subscription = Some(cx.observe(&diff, |this, _diff, cx| {
                     this.maybe_reveal_diff(cx);
@@ -1973,7 +2072,7 @@ impl ReviewPanel {
                     let head_ref = Some(pr.head_sha.clone());
                     let tab_label = Some(SharedString::from(format!("#{}", pr.number)));
                     workspace.update(cx, |workspace, cx| {
-                        git_ui::project_diff::ProjectDiff::deploy_merge_diff(
+                        crate::project_diff::ProjectDiff::deploy_merge_diff(
                             workspace,
                             base_ref,
                             head_ref,
@@ -1986,7 +2085,7 @@ impl ReviewPanel {
                         );
                     });
                 } else {
-                    window.dispatch_action(Box::new(git_ui::project_diff::BranchDiff), cx);
+                    window.dispatch_action(Box::new(crate::project_diff::BranchDiff), cx);
                 }
             }
             PendingAction::SelectPullRequest(pr) => {
@@ -2001,7 +2100,7 @@ impl ReviewPanel {
                     let head_ref = Some(pr.head_sha.clone());
                     let tab_label = Some(SharedString::from(format!("#{}", pr.number)));
                     workspace.update(cx, |workspace, cx| {
-                        git_ui::project_diff::ProjectDiff::deploy_merge_diff(
+                        crate::project_diff::ProjectDiff::deploy_merge_diff(
                             workspace, base_ref, head_ref, None, tab_label, true, window, cx,
                         );
                     });
@@ -2019,7 +2118,7 @@ impl ReviewPanel {
                         // `None` path → opens at Anchor::Min (top of the first
                         // file) with no navigation. Held (review_loading=true)
                         // until files load and comments inject, then revealed.
-                        git_ui::project_diff::ProjectDiff::deploy_merge_diff(
+                        crate::project_diff::ProjectDiff::deploy_merge_diff(
                             workspace, base_ref, head_ref, None, tab_label, true, window, cx,
                         );
                     });
@@ -2029,55 +2128,116 @@ impl ReviewPanel {
     }
 }
 
+impl ReviewPanel {
+    /// Forward roving-selection actions to the PR list when it's the active
+    /// view. No-ops otherwise, so the bindings are harmless in other views.
+    fn with_pull_request_list(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut PullRequestList, &mut Context<PullRequestList>),
+    ) {
+        if !self.showing_list() {
+            return;
+        }
+        if let Some((pr_list, _)) = &self.pull_request_list {
+            pr_list.update(cx, |list, cx| f(list, cx));
+        }
+    }
+
+    /// Forward file-list navigation to the drilled-in review view.
+    fn with_review_view(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut ReviewView, &mut Context<ReviewView>),
+    ) {
+        if !self.showing_review() {
+            return;
+        }
+        if let Some((review_view, _)) = &self.review_view {
+            review_view.update(cx, |view, cx| f(view, cx));
+        }
+    }
+
+    fn select_next_pr(&mut self, _: &menu::SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
+        self.with_pull_request_list(cx, |list, cx| list.select_next(cx));
+        self.with_review_view(cx, |view, cx| view.select_next_file(cx));
+    }
+
+    fn select_previous_pr(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_pull_request_list(cx, |list, cx| list.select_previous(cx));
+        self.with_review_view(cx, |view, cx| view.select_previous_file(cx));
+    }
+
+    fn select_first_pr(
+        &mut self,
+        _: &menu::SelectFirst,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_pull_request_list(cx, |list, cx| list.select_first(cx));
+        self.with_review_view(cx, |view, cx| view.select_first_file(cx));
+    }
+
+    fn select_last_pr(&mut self, _: &menu::SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
+        self.with_pull_request_list(cx, |list, cx| list.select_last(cx));
+        self.with_review_view(cx, |view, cx| view.select_last_file(cx));
+    }
+
+    fn confirm_pr(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        self.with_pull_request_list(cx, |list, cx| list.confirm_selected(cx));
+        self.with_review_view(cx, |view, cx| view.open_selected_file(cx));
+    }
+
+    fn toggle_viewed(&mut self, _: &ToggleViewed, _window: &mut Window, cx: &mut Context<Self>) {
+        self.with_review_view(cx, |view, cx| view.toggle_selected_file_viewed(cx));
+    }
+}
+
 impl Render for ReviewPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.flush_pending_action(window, cx);
+        let tab_bar = self.render_tab_bar(cx);
         let header = self.render_header(window, cx);
+        let loading = || {
+            v_flex()
+                .size_full()
+                .justify_center()
+                .items_center()
+                .child(Label::new("Loading…").color(Color::Muted))
+        };
         v_flex()
             .id("review_panel")
+            .key_context("ReviewPanel")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::select_next_pr))
+            .on_action(cx.listener(Self::select_previous_pr))
+            .on_action(cx.listener(Self::select_first_pr))
+            .on_action(cx.listener(Self::select_last_pr))
+            .on_action(cx.listener(Self::confirm_pr))
+            .on_action(cx.listener(Self::toggle_viewed))
+            .on_action(cx.listener(Self::activate_pull_requests_tab))
+            .on_action(cx.listener(Self::activate_configuration_tab))
             .size_full()
+            .child(tab_bar)
             .children(header)
-            .map(|parent| match &self.active_view {
-                ActiveView::PullRequestList => {
-                    if let Some((pr_list, _)) = &self.pull_request_list {
-                        parent.child(pr_list.clone())
-                    } else {
-                        parent.child(
-                            v_flex()
-                                .size_full()
-                                .justify_center()
-                                .items_center()
-                                .child(Label::new("Loading...").color(Color::Muted)),
-                        )
-                    }
-                }
-                ActiveView::ReviewThread => {
-                    if let Some((review_view, _)) = &self.review_view {
-                        parent.child(review_view.clone())
-                    } else {
-                        parent.child(
-                            v_flex()
-                                .size_full()
-                                .justify_center()
-                                .items_center()
-                                .child(Label::new("Loading...").color(Color::Muted)),
-                        )
-                    }
-                }
-                ActiveView::Configuration => {
-                    if let Some((configuration_view, _)) = &self.configuration_view {
-                        parent.child(configuration_view.clone())
-                    } else {
-                        parent.child(
-                            v_flex()
-                                .size_full()
-                                .justify_center()
-                                .items_center()
-                                .child(Label::new("Loading...").color(Color::Muted)),
-                        )
-                    }
-                }
+            .map(|parent| match self.active_tab {
+                ReviewPanelTab::PullRequests if self.reviewing => match &self.review_view {
+                    Some((review_view, _)) => parent.child(review_view.clone()),
+                    None => parent.child(loading()),
+                },
+                ReviewPanelTab::PullRequests => match &self.pull_request_list {
+                    Some((pr_list, _)) => parent.child(pr_list.clone()),
+                    None => parent.child(loading()),
+                },
+                ReviewPanelTab::Configuration => match &self.configuration_view {
+                    Some((configuration_view, _)) => parent.child(configuration_view.clone()),
+                    None => parent.child(loading()),
+                },
             })
     }
 }

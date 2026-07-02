@@ -10,8 +10,8 @@ use http_client::{AsyncBody, HttpClient, HttpRequestExt, RedirectPolicy, Request
 use serde::Deserialize;
 use std::sync::Arc;
 use ui::{
-    Button, ButtonStyle, Color, DynamicSpacing, Icon, IconButton, IconName, IconSize, IntoElement,
-    Label, LabelSize, Tooltip, div, h_flex, prelude::*, rems, v_flex,
+    Button, ButtonStyle, Color, CommonAnimationExt, DynamicSpacing, Icon, IconButton, IconName,
+    IconSize, IntoElement, Label, LabelSize, Tooltip, div, h_flex, prelude::*, rems, v_flex,
 };
 
 const GITHUB_API_URL: &str = "https://api.github.com";
@@ -42,6 +42,10 @@ pub struct ConfigurationView {
     source: GithubTokenSource,
     /// Login of the currently-resolved token, if validated.
     signed_in_login: Option<SharedString>,
+    /// True while the initial credential resolution is in flight, so we show a
+    /// loading state rather than flashing "Not signed in" before the token
+    /// (env / gh / keychain) has been resolved.
+    resolving: bool,
     status: Status,
     /// Whether the token input is obscured (it's a secret). Toggled by the
     /// reveal eye button.
@@ -80,6 +84,7 @@ impl ConfigurationView {
             token_editor,
             source: GithubTokenSource::None,
             signed_in_login: None,
+            resolving: true,
             status: Status::Idle,
             token_masked: true,
         };
@@ -109,6 +114,7 @@ impl ConfigurationView {
             this.update(cx, |this, cx| {
                 this.source = source;
                 this.signed_in_login = login.map(SharedString::from);
+                this.resolving = false;
                 cx.notify();
             })
         })
@@ -232,14 +238,37 @@ impl Render for ConfigurationView {
         v_flex()
             .size_full()
             .child(self.render_header(cx))
-            .child(
-                v_flex()
-                    .id("config-scroll")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .child(self.render_account_section(signed_in, cx))
-                    .child(self.render_token_section(signed_in, cx)),
-            )
+            .map(|parent| {
+                if self.resolving {
+                    // Credentials (env / gh / keychain) not yet resolved — show a
+                    // loader instead of flashing "Not signed in".
+                    parent.child(
+                        v_flex()
+                            .size_full()
+                            .justify_center()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Icon::new(IconName::ArrowCircle)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted)
+                                    .with_rotate_animation(2),
+                            )
+                            .child(
+                                Label::new("Checking GitHub sign-in…").color(Color::Muted),
+                            ),
+                    )
+                } else {
+                    parent.child(
+                        v_flex()
+                            .id("config-scroll")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .child(self.render_account_section(signed_in, cx))
+                            .child(self.render_token_section(signed_in, cx)),
+                    )
+                }
+            })
     }
 }
 

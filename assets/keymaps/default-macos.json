@@ -219,6 +219,21 @@
     },
   },
   {
+    "context": "ReviewPanel",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-1": "review_ui::ActivatePullRequestsTab",
+      "cmd-2": "review_ui::ActivateConfigurationTab",
+      "up": "menu::SelectPrevious",
+      "down": "menu::SelectNext",
+      "cmd-up": "menu::SelectFirst",
+      "cmd-down": "menu::SelectLast",
+      "enter": "menu::Confirm",
+      "space": "review_ui::ToggleViewed",
+      "escape": "review_ui::ToggleFocus",
+    },
+  },
+  {
     "context": "Markdown",
     "use_key_equivalents": true,
     "bindings": {
