@@ -22,7 +22,7 @@ use util::{paths::PathStyle, rel_path::RelPath};
 use ztracing::instrument;
 
 use crate::{
-    Project, WorktreeId,
+    ConflictSet, Project, WorktreeId,
     git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
 
@@ -92,7 +92,6 @@ impl BranchDiff {
                         .repo
                         .as_ref()
                         .is_some_and(|r| r.read(cx).snapshot().id == *event_repo_id),
-                    GitStoreEvent::ConflictsUpdated => this.repo.is_some(),
                     _ => false,
                 };
 
@@ -459,7 +458,7 @@ impl BranchDiff {
         work_dir: Arc<std::path::Path>,
         language_registry: Arc<LanguageRegistry>,
         cx: &Context<'_, Project>,
-    ) -> Task<Result<(Entity<Buffer>, Entity<BufferDiff>)>> {
+    ) -> Task<Result<(Entity<Buffer>, Entity<BufferDiff>, Entity<ConflictSet>)>> {
         let worktree_id = project_path.worktree_id;
         let task = cx.spawn(async move |project, cx| {
             // PR / explicit-head mode: show the file at the head commit (read-only),
@@ -503,7 +502,11 @@ impl BranchDiff {
                 });
                 let buffer = build_blob_buffer(head_text, file, &language_registry, cx).await?;
                 let diff = build_blob_diff(base_text, &buffer, &language_registry, cx).await?;
-                return Ok((buffer, diff));
+                // A read-only historic blob can't have merge conflicts, so hand
+                // back an empty conflict set to satisfy the shared return type.
+                let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+                let conflict_set = cx.new(|cx| ConflictSet::new(buffer_id, false, cx));
+                return Ok((buffer, diff, conflict_set));
             }
 
             let buffer = project
@@ -530,7 +533,14 @@ impl BranchDiff {
                     })?
                     .await?
             };
-            Ok((buffer, changes))
+            let conflict_set = project
+                .update(cx, |project, cx| {
+                    project.git_store().update(cx, |git_store, cx| {
+                        git_store.open_conflict_set(buffer.clone(), cx)
+                    })
+                })?
+                .await;
+            Ok((buffer, changes, conflict_set))
         });
         task
     }
@@ -558,7 +568,7 @@ fn diff_status_to_file_status(branch_diff: &git::status::TreeDiffStatus) -> File
 pub struct DiffBuffer {
     pub repo_path: RepoPath,
     pub file_status: FileStatus,
-    pub load: Task<Result<(Entity<Buffer>, Entity<BufferDiff>)>>,
+    pub load: Task<Result<(Entity<Buffer>, Entity<BufferDiff>, Entity<ConflictSet>)>>,
 }
 
 /// A synthetic `File` for a read-only buffer backed by a git blob (a file at a
@@ -660,28 +670,23 @@ async fn build_blob_diff(
         LineEnding::normalize(old_text);
     }
 
-    let language = cx.update(|cx| buffer.read(cx).language().cloned());
-    let buffer = cx.update(|cx| buffer.read(cx).snapshot());
+    let (language, buffer_snapshot) =
+        buffer.read_with(cx, |buffer, _| (buffer.language().cloned(), buffer.text_snapshot()));
+    let base_text = old_text.map(|old_text| Arc::from(old_text.as_str()));
 
-    let diff = cx.new(|cx| BufferDiff::new(&buffer.text, cx));
+    let diff = cx.new(|cx| {
+        BufferDiff::new(
+            &buffer_snapshot,
+            language,
+            Some(language_registry.clone()),
+            cx,
+        )
+    });
 
-    let update = diff
-        .update(cx, |diff, cx| {
-            diff.update_diff(
-                buffer.text.clone(),
-                old_text.map(|old_text| Arc::from(old_text.as_str())),
-                Some(true),
-                language.clone(),
-                cx,
-            )
-        })
-        .await;
-
-    diff.update(cx, |diff, cx| {
-        diff.language_changed(language, Some(language_registry.clone()), cx);
-        diff.set_snapshot(update, &buffer.text, cx)
-    })
-    .await;
+    let set_base_text = diff.update(cx, |diff, cx| {
+        diff.set_base_text(base_text, buffer_snapshot.clone(), cx)
+    });
+    set_base_text.await;
 
     Ok(diff)
 }

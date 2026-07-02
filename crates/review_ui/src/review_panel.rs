@@ -454,7 +454,7 @@ impl ReviewPanel {
 
         PopoverMenu::new("review-nav-menu")
             .trigger_with_tooltip(
-                IconButton::new("review-nav-menu", IconName::MenuAltTemp)
+                IconButton::new("review-nav-menu", IconName::Menu)
                     .icon_size(IconSize::Small),
                 Tooltip::text("Recent Reviews"),
             )
