@@ -199,7 +199,6 @@ impl VsCodeSettings {
             language_models: None,
             line_indicator_format: None,
             log: None,
-            review_panel: None,
             node: self.node_binary_settings(),
 
             outline_panel: self.outline_panel_settings_content(),

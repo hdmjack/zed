@@ -6,6 +6,7 @@ use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::project_diff::{BranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::solo_diff_view::SoloDiffView;
+use crate::review_panel::{ReviewPanel, ReviewPanelEvent, SerializedReviewPanel};
 use crate::{branch_picker, picker_prompt, render_remote_button};
 use crate::{
     git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
@@ -139,6 +140,8 @@ actions!(
         ActivateChangesTab,
         /// Activates the History tab.
         ActivateHistoryTab,
+        /// Activates the Pull Requests tab.
+        ActivatePullRequestsTab,
     ]
 );
 
@@ -377,6 +380,10 @@ struct SerializedGitPanel {
     signoff_enabled: bool,
     #[serde(default)]
     commit_messages: BTreeMap<String, SerializedCommitMessage>,
+    /// The in-progress PR review, folded in from the former standalone review
+    /// panel so reopening the workspace resumes the same PR.
+    #[serde(default, skip_serializing_if = "SerializedReviewPanel::is_empty")]
+    pull_request_review: SerializedReviewPanel,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -393,6 +400,7 @@ struct SerializedCommitMessage {
 enum GitPanelTab {
     Changes,
     History,
+    PullRequests,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -794,6 +802,14 @@ pub struct GitPanel {
     bulk_staging: Option<BulkStaging>,
     stash_entries: GitStash,
     active_tab: GitPanelTab,
+    /// The embedded PR review view, lazily created when the Pull Requests tab
+    /// is first activated (its construction resolves the provider and loads
+    /// branches, so it's deferred until needed).
+    pull_request_review: Option<Entity<ReviewPanel>>,
+    /// Restored-but-not-yet-applied review identity, seeded into the review
+    /// view when it's first created.
+    pull_request_restore: SerializedReviewPanel,
+    _pull_request_review_subscription: Option<Subscription>,
     commit_history_scroll_handle: UniformListScrollHandle,
     commit_history_shas: Option<Vec<Oid>>,
     focused_history_entry: Option<usize>,
@@ -882,6 +898,10 @@ impl GitPanel {
             let path = active_work_directory_abs_path.as_ref()?;
             panel.commit_messages.get(path)
         });
+        let pull_request_restore = serialized_panel
+            .as_ref()
+            .map(|panel| panel.pull_request_review.clone())
+            .unwrap_or_default();
         // Seed the placeholder editor with the restored draft when the active
         // repository already matches the serialized one, so the message is
         // present immediately on restart instead of only after the commit
@@ -1067,6 +1087,9 @@ impl GitPanel {
                 bulk_staging: None,
                 stash_entries: Default::default(),
                 active_tab: GitPanelTab::Changes,
+                pull_request_review: None,
+                pull_request_restore,
+                _pull_request_review_subscription: None,
                 commit_history_scroll_handle: UniformListScrollHandle::new(),
                 commit_history_shas: None,
                 focused_history_entry: None,
@@ -1159,6 +1182,12 @@ impl GitPanel {
     fn serialize(&mut self, cx: &mut Context<Self>) {
         let signoff_enabled = self.signoff_enabled;
         let commit_messages = self.serialized_commit_messages(cx);
+        // Read the live review identity if the tab has been opened; otherwise
+        // preserve the restore seed we haven't applied yet.
+        let pull_request_review = match &self.pull_request_review {
+            Some(review) => review.read(cx).serialized_state(),
+            None => self.pull_request_restore.clone(),
+        };
         let kvp = KeyValueStore::global(cx);
 
         self.pending_serialization = cx.spawn(async move |git_panel, cx| {
@@ -1185,6 +1214,7 @@ impl GitPanel {
                         serde_json::to_string(&SerializedGitPanel {
                             signoff_enabled,
                             commit_messages,
+                            pull_request_review,
                         })?,
                     )
                     .await?;
@@ -1257,13 +1287,24 @@ impl GitPanel {
         cx.notify();
     }
 
+    /// The embedded PR review view, if the Pull Requests tab has been opened.
+    /// Used by workspace-level review actions (dispatched from the diff editor)
+    /// to reach the review orchestration.
+    pub(crate) fn pull_request_review(&self) -> Option<Entity<ReviewPanel>> {
+        self.pull_request_review.clone()
+    }
+
     fn dispatch_context(&self, window: &mut Window, cx: &Context<Self>) -> KeyContext {
         let mut dispatch_context = KeyContext::new_with_defaults();
         dispatch_context.add("GitPanel");
 
         if self.commit_editor.read(cx).is_focused(window) {
             dispatch_context.add("CommitEditor");
-        } else if self.focus_handle.contains_focused(window, cx) {
+        } else if self.active_tab != GitPanelTab::PullRequests
+            && self.focus_handle.contains_focused(window, cx)
+        {
+            // The Pull Requests tab embeds the review view, which sets its own
+            // key context; don't layer the changes-list bindings on top of it.
             dispatch_context.add("menu");
             dispatch_context.add("ChangesList");
         }
@@ -5621,11 +5662,20 @@ impl GitPanel {
             .child(Divider::vertical().color(ui::DividerColor::BorderFaded))
             .child(tab(
                 ElementId::Name("history-tab".into()),
-                active_tab != GitPanelTab::Changes,
+                active_tab == GitPanelTab::History,
                 false,
                 "History".into(),
                 GitPanelTab::History,
                 ActivateHistoryTab.boxed_clone(),
+            ))
+            .child(Divider::vertical().color(ui::DividerColor::BorderFaded))
+            .child(tab(
+                ElementId::Name("pull-requests-tab".into()),
+                active_tab == GitPanelTab::PullRequests,
+                false,
+                "Pull Requests".into(),
+                GitPanelTab::PullRequests,
+                ActivatePullRequestsTab.boxed_clone(),
             ))
     }
 
@@ -5736,6 +5786,15 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::History, window, cx);
     }
 
+    fn activate_pull_requests_tab(
+        &mut self,
+        _: &ActivatePullRequestsTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_active_tab(GitPanelTab::PullRequests, window, cx);
+    }
+
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == tab {
             return;
@@ -5753,8 +5812,38 @@ impl GitPanel {
                 self.focused_history_entry = None;
                 self._repo_subscriptions.clear();
             }
+            GitPanelTab::PullRequests => {
+                if let Some(review) = self.ensure_pull_request_review(window, cx) {
+                    review.focus_handle(cx).focus(window, cx);
+                }
+            }
         }
         cx.notify();
+    }
+
+    /// Lazily construct the embedded PR review view. Deferred until the Pull
+    /// Requests tab is first activated because construction resolves the git
+    /// hosting provider and loads branches.
+    fn ensure_pull_request_review(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ReviewPanel>> {
+        if self.pull_request_review.is_none() {
+            let workspace = self.workspace.upgrade()?;
+            let weak_workspace = self.workspace.clone();
+            let restore = std::mem::take(&mut self.pull_request_restore);
+            let restore = (!restore.is_empty()).then_some(restore);
+            let review = workspace.update(cx, |workspace, cx| {
+                cx.new(|cx| ReviewPanel::new(workspace, weak_workspace, restore, window, cx))
+            });
+            self._pull_request_review_subscription =
+                Some(cx.subscribe(&review, |this, _review, event, cx| match event {
+                    ReviewPanelEvent::SerializeNeeded => this.serialize(cx),
+                }));
+            self.pull_request_review = Some(review);
+        }
+        self.pull_request_review.clone()
     }
 
     fn preload_commit_history(&mut self, cx: &mut Context<Self>) {
@@ -7259,6 +7348,7 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::activate_changes_tab))
             .on_action(cx.listener(Self::activate_history_tab))
+            .on_action(cx.listener(Self::activate_pull_requests_tab))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
@@ -7295,6 +7385,10 @@ impl Render for GitPanel {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
+                        GitPanelTab::PullRequests => match &self.pull_request_review {
+                            Some(review) => this.child(review.clone()),
+                            None => this,
+                        },
                     })
                     .into_any_element(),
             )
@@ -9146,6 +9240,7 @@ mod tests {
             SerializedGitPanel {
                 signoff_enabled: false,
                 commit_messages: panel.serialized_commit_messages(cx),
+                pull_request_review: Default::default(),
             }
         });
 
@@ -9197,6 +9292,7 @@ mod tests {
                     ..Default::default()
                 },
             )]),
+            pull_request_review: Default::default(),
         };
         let mismatched_panel = workspace.update_in(cx, |workspace, window, cx| {
             GitPanel::new_with_serialized_panel(

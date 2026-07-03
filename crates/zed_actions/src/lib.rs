@@ -757,20 +757,12 @@ pub mod review_panel {
     use gpui::actions;
 
     actions!(
-        review_ui,
+        pull_request,
         [
-            /// Toggles focus on the review UI.
-            ToggleFocus,
-            /// Opens the selected file in the editor (working tree version).
-            OpenLocalFile,
             /// Adds a PR review comment on the current line or selection.
             AddComment,
             /// Submits the focused PR comment composer.
             SubmitComment,
-            /// Activates the pull requests tab.
-            ActivatePullRequestsTab,
-            /// Activates the configuration tab.
-            ActivateConfigurationTab,
             /// Toggles the viewed state of the selected file in a PR review.
             ToggleViewed
         ]

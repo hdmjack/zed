@@ -147,6 +147,10 @@ pub fn migrate_keymap(text: &str) -> Result<Option<String>> {
             migrations::m_2026_03_23::KEYMAP_PATTERNS,
             &KEYMAP_QUERY_2026_03_23,
         ),
+        MigrationType::TreeSitter(
+            migrations::m_2026_07_02::KEYMAP_PATTERNS,
+            &KEYMAP_QUERY_2026_07_02,
+        ),
     ];
     run_migrations(text, migrations)
 }
@@ -257,6 +261,7 @@ pub fn migrate_settings(text: &str) -> Result<Option<String>> {
             migrations::m_2026_05_04::SETTINGS_PATTERNS,
             &SETTINGS_QUERY_2026_05_04,
         ),
+        MigrationType::Json(migrations::m_2026_07_02::remove_review_panel),
     ];
     run_migrations(text, migrations)
 }
@@ -402,6 +407,10 @@ define_query!(
 define_query!(
     SETTINGS_QUERY_2026_05_04,
     migrations::m_2026_05_04::SETTINGS_PATTERNS
+);
+define_query!(
+    KEYMAP_QUERY_2026_07_02,
+    migrations::m_2026_07_02::KEYMAP_PATTERNS
 );
 
 // custom query
@@ -5421,5 +5430,75 @@ mod tests {
             .unindent(),
             None,
         );
+    }
+
+    #[test]
+    fn test_migrate_review_panel_actions_and_contexts() {
+        assert_migrate_keymap(
+            &r#"
+            [
+                {
+                    "context": "ReviewComposer > Editor",
+                    "bindings": {
+                        "cmd-enter": "review_ui::SubmitComment"
+                    }
+                },
+                {
+                    "context": "ReviewPanel",
+                    "bindings": {
+                        "cmd-1": "review_ui::ActivatePullRequestsTab",
+                        "space": "review_ui::ToggleViewed"
+                    }
+                }
+            ]
+            "#
+            .unindent(),
+            Some(
+                &r#"
+            [
+                {
+                    "context": "PullRequestComposer > Editor",
+                    "bindings": {
+                        "cmd-enter": "pull_request::SubmitComment"
+                    }
+                },
+                {
+                    "context": "PullRequestPanel",
+                    "bindings": {
+                        "cmd-1": "git_panel::ActivatePullRequestsTab",
+                        "space": "pull_request::ToggleViewed"
+                    }
+                }
+            ]
+            "#
+                .unindent(),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_remove_review_panel_settings() {
+        assert_migrate_settings(
+            &r#"
+            {
+                "review_panel": {
+                    "dock": "right"
+                },
+                "theme": "One Dark"
+            }
+            "#
+            .unindent(),
+            Some(
+                &r#"
+            {
+                "theme": "One Dark"
+            }
+            "#
+                .unindent(),
+            ),
+        );
+
+        // No review_panel key — unchanged.
+        assert_migrate_settings(&r#"{ "theme": "One Dark" }"#.unindent(), None);
     }
 }

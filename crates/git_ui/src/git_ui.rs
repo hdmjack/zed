@@ -62,14 +62,13 @@ pub mod worktree_names;
 pub mod worktree_picker;
 pub mod worktree_service;
 
-// PR review (relocated from the former `review_ui` crate).
+// PR review, hosted as the Git panel's Pull Requests tab.
 mod comment_card;
 mod configuration_view;
 mod file_list;
 mod inline_comment;
 mod pull_request_list;
 mod review_panel;
-mod review_panel_settings;
 mod review_view;
 
 pub use blame_ui::GitBlameStatus;

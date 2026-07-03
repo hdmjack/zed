@@ -4,7 +4,6 @@ use crate::inline_comment::{ApplySuggestion, ReactToComment, SuggestionBlock, co
 use crate::pull_request_list::{PullRequestList, PullRequestListEvent, RemoteState};
 use crate::review_view::{ReviewView, ReviewViewEvent};
 use git_hosting_providers::resolve_github_token;
-use crate::review_panel_settings::ReviewPanelSettings;
 use pull_request::{PullRequestInfo, ReactionContent, ReviewComment, ReviewProvider};
 use markdown::Markdown;
 use anyhow::Result;
@@ -12,12 +11,11 @@ use collections::HashMap;
 use editor::display_map::{BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
 use editor::{Addon, Editor, EditorEvent};
 use multi_buffer::ExcerptBoundaryInfo;
-use fs::Fs;
 use git::repository::RepoPath;
 use git::status::{DiffTreeType, TreeDiff};
 use gpui::{
-    AnyElement, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Pixels, Render, SharedString, Subscription, WeakEntity, Window,
+    AnyElement, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Render,
+    SharedString, Subscription, WeakEntity, Window,
 };
 use text::{Point, ToPoint};
 use http_client::HttpClient;
@@ -25,7 +23,6 @@ use project::{
     Project,
     git_store::{GitStoreEvent, Repository, RepositoryEvent},
 };
-use settings::{self, Settings};
 use std::sync::Arc;
 use std::time::Duration;
 use ui::{
@@ -33,28 +30,35 @@ use ui::{
     IconSize, IntoElement, KeybindingHint, Label, LabelSize, PopoverMenu, PopoverMenuHandle, Tab,
     ToggleState, Tooltip, h_flex, prelude::*, v_flex,
 };
-use db::kvp::KeyValueStore;
 use serde::{Deserialize, Serialize};
-use util::ResultExt as _;
-use workspace::{
-    SERIALIZATION_THROTTLE_TIME, Workspace,
-    dock::{DockPosition, Panel, PanelEvent},
-};
-use zed_actions::review_panel::{
-    ActivateConfigurationTab, ActivatePullRequestsTab, AddComment, SubmitComment, ToggleFocus,
-    ToggleViewed,
-};
-
-const REVIEW_PANEL_KEY: &str = "ReviewPanel";
+use workspace::Workspace;
+use zed_actions::review_panel::{AddComment, SubmitComment, ToggleViewed};
 
 /// Persisted review state, restored when the workspace reopens. Only the PR's
 /// identity is stored; the rest of `PullRequestInfo` is re-fetched so the head
-/// SHA (used for inline comments) is never stale.
-#[derive(Default, Serialize, Deserialize)]
+/// SHA (used for inline comments) is never stale. Persisted as part of the
+/// hosting `GitPanel`'s serialized state.
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct SerializedReviewPanel {
-    remote_owner: Option<String>,
-    remote_repo: Option<String>,
-    selected_pr_number: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selected_pr_number: Option<u32>,
+}
+
+impl SerializedReviewPanel {
+    /// Whether there's nothing worth persisting (no PR selected).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.selected_pr_number.is_none()
+    }
+}
+
+/// Events emitted by the embedded review view to its hosting `GitPanel`.
+pub(crate) enum ReviewPanelEvent {
+    /// The selected PR changed; the git panel should persist the new identity.
+    SerializeNeeded,
 }
 
 #[derive(Clone)]
@@ -94,7 +98,6 @@ pub struct ReviewPanel {
     focus_handle: FocusHandle,
     recent_reviews_menu_handle: PopoverMenuHandle<ContextMenu>,
     options_menu_handle: PopoverMenuHandle<ContextMenu>,
-    fs: Arc<dyn Fs>,
     active_tab: ReviewPanelTab,
     /// Whether the Pull Requests tab is drilled into a specific PR's review
     /// (the file/thread view) rather than showing the list.
@@ -132,7 +135,6 @@ pub struct ReviewPanel {
     /// Restored-but-not-yet-applied review state (applied once the provider and
     /// remote resolve).
     restore: Option<SerializedReviewPanel>,
-    pending_serialization: gpui::Task<()>,
 }
 
 /// State for an open inline composer (reply to a thread, or a new comment on a
@@ -248,14 +250,19 @@ impl Addon for ReviewEditorAddon {
     }
 }
 
-pub fn register(workspace: &mut Workspace) {
-    workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-        workspace.toggle_panel_focus::<ReviewPanel>(window, cx);
-    });
+/// The review view now lives inside the `GitPanel`'s Pull Requests tab rather
+/// than a standalone panel; reach it through the git panel.
+fn review_panel(workspace: &Workspace, cx: &App) -> Option<Entity<ReviewPanel>> {
+    workspace
+        .panel::<crate::git_panel::GitPanel>(cx)?
+        .read(cx)
+        .pull_request_review()
+}
 
+pub fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, action: &ApplySuggestion, _window, cx| {
         let comment_id = action.comment_id;
-        let Some(panel) = workspace.panel::<ReviewPanel>(cx) else {
+        let Some(panel) = review_panel(workspace, cx) else {
             return;
         };
 
@@ -269,7 +276,7 @@ pub fn register(workspace: &mut Workspace) {
     });
 
     workspace.register_action(|workspace, _: &AddComment, window, cx| {
-        let Some(panel) = workspace.panel::<ReviewPanel>(cx) else {
+        let Some(panel) = review_panel(workspace, cx) else {
             return;
         };
         let Some(editor) = workspace
@@ -284,7 +291,7 @@ pub fn register(workspace: &mut Workspace) {
     });
 
     workspace.register_action(|workspace, action: &ReactToComment, _window, cx| {
-        let Some(panel) = workspace.panel::<ReviewPanel>(cx) else {
+        let Some(panel) = review_panel(workspace, cx) else {
             return;
         };
         let action = action.clone();
@@ -302,7 +309,6 @@ impl ReviewPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let fs = workspace.app_state().fs.clone();
         let project = workspace.project().clone();
         let active_repository = project.read(cx).active_repository(cx);
         let git_store = project.read(cx).git_store().clone();
@@ -347,7 +353,6 @@ impl ReviewPanel {
             tree_diff: None,
             review_view: None,
             focus_handle: cx.focus_handle(),
-            fs,
             recent_reviews_menu_handle: PopoverMenuHandle::default(),
             options_menu_handle: PopoverMenuHandle::default(),
             active_tab: ReviewPanelTab::PullRequests,
@@ -372,7 +377,6 @@ impl ReviewPanel {
             next_composer_id: 0,
             _workspace_subscription: workspace_subscription,
             restore,
-            pending_serialization: gpui::Task::ready(()),
         };
         // Create the PR list up front so pull requests start loading in the
         // background as soon as the provider resolves, before the view is opened.
@@ -382,69 +386,19 @@ impl ReviewPanel {
         this
     }
 
-    pub async fn load(
-        workspace: WeakEntity<Workspace>,
-        mut cx: AsyncWindowContext,
-    ) -> Result<Entity<Self>> {
-        let key = workspace
-            .read_with(&cx, |workspace, _| Self::serialization_key(workspace))
-            .ok()
-            .flatten();
-        let serialized = match (key, cx.update(|_, cx| KeyValueStore::global(cx)).ok()) {
-            (Some(key), Some(kvp)) => cx
-                .background_spawn(async move { kvp.read_kvp(&key) })
-                .await
-                .log_err()
-                .flatten()
-                .and_then(|value| serde_json::from_str::<SerializedReviewPanel>(&value).log_err()),
-            _ => None,
-        };
-
-        workspace.update_in(&mut cx, |workspace, window, cx| {
-            let weak_workspace = workspace.weak_handle();
-            cx.new(|cx| ReviewPanel::new(workspace, weak_workspace, serialized, window, cx))
-        })
-    }
-
-    fn serialization_key(workspace: &Workspace) -> Option<String> {
-        workspace
-            .database_id()
-            .map(|id| i64::from(id).to_string())
-            .or_else(|| workspace.session_id())
-            .map(|id| format!("{}-{}", REVIEW_PANEL_KEY, id))
-    }
-
-    /// Persist the current review identity (debounced), so reopening the
-    /// workspace resumes the same PR.
-    fn serialize(&mut self, cx: &mut Context<Self>) {
-        let state = SerializedReviewPanel {
+    /// The current review identity, persisted by the hosting `GitPanel` so
+    /// reopening the workspace resumes the same PR.
+    pub(crate) fn serialized_state(&self) -> SerializedReviewPanel {
+        SerializedReviewPanel {
             remote_owner: self.remote_owner.clone(),
             remote_repo: self.remote_repo.clone(),
             selected_pr_number: self.selected_pr.as_ref().map(|pr| pr.number),
-        };
-        self.pending_serialization = cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(SERIALIZATION_THROTTLE_TIME)
-                .await;
-            let Some((key, kvp)) = this
-                .read_with(cx, |this, cx| {
-                    this._workspace
-                        .read_with(cx, |workspace, _| Self::serialization_key(workspace))
-                        .ok()
-                        .flatten()
-                        .map(|key| (key, KeyValueStore::global(cx)))
-                })
-                .ok()
-                .flatten()
-            else {
-                return;
-            };
-            if let Ok(value) = serde_json::to_string(&state) {
-                cx.background_spawn(async move { kvp.write_kvp(key, value).await })
-                    .await
-                    .log_err();
-            }
-        });
+        }
+    }
+
+    /// Ask the hosting `GitPanel` to persist the current review identity.
+    fn serialize(&mut self, cx: &mut Context<Self>) {
+        cx.emit(ReviewPanelEvent::SerializeNeeded);
     }
 
     /// True when the Pull Requests tab is showing the list (not drilled into a
@@ -476,60 +430,6 @@ impl ReviewPanel {
         }
     }
 
-    fn activate_pull_requests_tab(
-        &mut self,
-        _: &ActivatePullRequestsTab,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.activate_tab(ReviewPanelTab::PullRequests, window, cx);
-    }
-
-    fn activate_configuration_tab(
-        &mut self,
-        _: &ActivateConfigurationTab,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.activate_tab(ReviewPanelTab::Configuration, window, cx);
-    }
-
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let tab = |id: &'static str,
-                   label: &'static str,
-                   tab: ReviewPanelTab,
-                   cx: &mut Context<Self>| {
-            Button::new(id, label)
-                .style(ui::ButtonStyle::Subtle)
-                .toggle_state(self.active_tab == tab)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.activate_tab(tab, window, cx);
-                }))
-        };
-
-        h_flex()
-            .flex_none()
-            .w_full()
-            .h(Tab::container_height(cx))
-            .gap(DynamicSpacing::Base02.rems(cx))
-            .px(DynamicSpacing::Base04.rems(cx))
-            .bg(cx.theme().colors().tab_bar_background)
-            .border_b_1()
-            .border_color(cx.theme().colors().border)
-            .child(tab(
-                "review-tab-prs",
-                "Pull Requests",
-                ReviewPanelTab::PullRequests,
-                cx,
-            ))
-            .child(tab(
-                "review-tab-config",
-                "Configuration",
-                ReviewPanelTab::Configuration,
-                cx,
-            ))
-            .into_any_element()
-    }
 
     fn refresh_pull_requests(&mut self, cx: &mut Context<Self>) {
         if let Some((pr_list, _)) = &self.pull_request_list {
@@ -749,21 +649,49 @@ impl ReviewPanel {
             return Some(
                 bar.child(div().flex_1().children(filter_bar))
                     .child(
-                        actions.child(
-                            IconButton::new("new-review", IconName::Plus)
-                                .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text("New Review"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.show_pull_request_list(window, cx);
-                                })),
-                        ),
+                        actions
+                            .child(
+                                IconButton::new("new-review", IconName::Plus)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("New Review"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.show_pull_request_list(window, cx);
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("configure-review", IconName::Settings)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Configuration"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.activate_tab(
+                                            ReviewPanelTab::Configuration,
+                                            window,
+                                            cx,
+                                        );
+                                    })),
+                            ),
                     )
                     .into_any_element(),
             );
         }
 
-        // Configuration tab: the tab bar is the only chrome; no sub-header.
-        None
+        // Configuration view: no tab bar, so surface a back arrow and title.
+        Some(
+            bar.child(
+                IconButton::new("back-from-config", IconName::ArrowLeft)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Back to pull requests"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.activate_tab(ReviewPanelTab::PullRequests, window, cx);
+                    })),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .child(Label::new("Configuration").color(Color::Muted)),
+            )
+            .into_any_element(),
+        )
     }
 
     fn set_remote_state(&mut self, state: RemoteState, cx: &mut Context<Self>) {
@@ -2201,7 +2129,6 @@ impl ReviewPanel {
 impl Render for ReviewPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.flush_pending_action(window, cx);
-        let tab_bar = self.render_tab_bar(cx);
         let header = self.render_header(window, cx);
         let loading = || {
             v_flex()
@@ -2212,7 +2139,7 @@ impl Render for ReviewPanel {
         };
         v_flex()
             .id("review_panel")
-            .key_context("ReviewPanel")
+            .key_context("PullRequestPanel")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::select_next_pr))
             .on_action(cx.listener(Self::select_previous_pr))
@@ -2220,10 +2147,7 @@ impl Render for ReviewPanel {
             .on_action(cx.listener(Self::select_last_pr))
             .on_action(cx.listener(Self::confirm_pr))
             .on_action(cx.listener(Self::toggle_viewed))
-            .on_action(cx.listener(Self::activate_pull_requests_tab))
-            .on_action(cx.listener(Self::activate_configuration_tab))
             .size_full()
-            .child(tab_bar)
             .children(header)
             .map(|parent| match self.active_tab {
                 ReviewPanelTab::PullRequests if self.reviewing => match &self.review_view {
@@ -2248,56 +2172,7 @@ impl Focusable for ReviewPanel {
     }
 }
 
-impl EventEmitter<PanelEvent> for ReviewPanel {}
-
-impl Panel for ReviewPanel {
-    fn persistent_name() -> &'static str {
-        "ReviewPanel"
-    }
-
-    fn panel_key() -> &'static str {
-        REVIEW_PANEL_KEY
-    }
-
-    fn position(&self, _window: &Window, cx: &App) -> DockPosition {
-        ReviewPanelSettings::get_global(cx).dock
-    }
-
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right)
-    }
-
-    fn set_position(
-        &mut self,
-        position: DockPosition,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
-            settings.review_panel.get_or_insert_default().dock = Some(position.into())
-        });
-    }
-
-    fn default_size(&self, _window: &Window, cx: &App) -> Pixels {
-        ReviewPanelSettings::get_global(cx).default_width
-    }
-
-    fn icon(&self, _window: &Window, cx: &App) -> Option<ui::IconName> {
-        Some(ui::IconName::PullRequest).filter(|_| ReviewPanelSettings::get_global(cx).button)
-    }
-
-    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-        Some("Review Panel")
-    }
-
-    fn toggle_action(&self) -> Box<dyn gpui::Action> {
-        Box::new(ToggleFocus)
-    }
-
-    fn activation_priority(&self) -> u32 {
-        10
-    }
-}
+impl EventEmitter<ReviewPanelEvent> for ReviewPanel {}
 
 /// Render an inline comment thread block with a trailing Reply button that
 /// opens the reply composer for the thread's root comment.
@@ -2408,7 +2283,7 @@ impl RenderOnce for ComposerBubble {
         let action_panel = self.panel.clone();
         let cancel_panel = self.panel;
 
-        // `cmd-enter` (bound to SubmitComment in the ReviewComposer key context)
+        // `cmd-enter` (bound to SubmitComment in the PullRequestComposer key context)
         // submits without leaving the editor.
         let submit_hint = KeybindingHint::new(
             ui::KeyBinding::for_action(&SubmitComment, cx),
@@ -2426,7 +2301,7 @@ impl RenderOnce for ComposerBubble {
             .border_1()
             .border_color(colors.border)
             .bg(colors.element_background)
-            .key_context("ReviewComposer")
+            .key_context("PullRequestComposer")
             .on_action(move |_: &SubmitComment, _window, cx| {
                 action_panel
                     .update(cx, |panel, cx| panel.submit_inline_composer(id, cx))

@@ -212,25 +212,22 @@
     },
   },
   {
-    "context": "ReviewComposer > Editor",
+    "context": "PullRequestComposer > Editor",
     "use_key_equivalents": true,
     "bindings": {
-      "cmd-enter": "review_ui::SubmitComment",
+      "cmd-enter": "pull_request::SubmitComment",
     },
   },
   {
-    "context": "ReviewPanel",
+    "context": "PullRequestPanel",
     "use_key_equivalents": true,
     "bindings": {
-      "cmd-1": "review_ui::ActivatePullRequestsTab",
-      "cmd-2": "review_ui::ActivateConfigurationTab",
       "up": "menu::SelectPrevious",
       "down": "menu::SelectNext",
       "cmd-up": "menu::SelectFirst",
       "cmd-down": "menu::SelectLast",
       "enter": "menu::Confirm",
-      "space": "review_ui::ToggleViewed",
-      "escape": "review_ui::ToggleFocus",
+      "space": "pull_request::ToggleViewed",
     },
   },
   {
@@ -1089,6 +1086,7 @@
     "bindings": {
       "cmd-1": "git_panel::ActivateChangesTab",
       "cmd-2": "git_panel::ActivateHistoryTab",
+      "cmd-3": "git_panel::ActivatePullRequestsTab",
     },
   },
   {

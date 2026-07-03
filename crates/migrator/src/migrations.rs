@@ -364,3 +364,11 @@ pub(crate) mod m_2026_05_04 {
 
     pub(crate) use settings::SETTINGS_PATTERNS;
 }
+
+pub(crate) mod m_2026_07_02 {
+    mod keymap;
+    mod settings;
+
+    pub(crate) use keymap::KEYMAP_PATTERNS;
+    pub(crate) use settings::remove_review_panel;
+}
